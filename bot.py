@@ -10,14 +10,12 @@ from binance.client import Client
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-PAIR_CONFIG = os.getenv(
-    "PAIR_CONFIG",
-    "SOLUSDC|AVAXUSDC|100|-10000"
-)
+PAIR_CONFIG = os.getenv("PAIR_CONFIG", "SOLUSDC|AVAXUSDC|100|-10000")
 CHECK_SEC = int(os.getenv("CHECK_SEC", "2"))
-
-# Kapanıştan sonra borsanın pozisyonu güncellemesi için kısa bekleme
 POST_CLOSE_SLEEP_SEC = int(os.getenv("POST_CLOSE_SLEEP_SEC", "2"))
+
+# Timestamp problems fix
+RECV_WINDOW = int(os.getenv("RECV_WINDOW", "60000"))  # 60 seconds
 
 if not API_KEY or not API_SECRET:
     raise SystemExit("Missing BINANCE_API_KEY or BINANCE_API_SECRET")
@@ -25,6 +23,9 @@ if not API_KEY or not API_SECRET:
 client = Client(API_KEY, API_SECRET)
 
 
+# =========================
+# DATA STRUCTURES
+# =========================
 @dataclass
 class PairRule:
     sym1: str
@@ -35,9 +36,12 @@ class PairRule:
 
 @dataclass
 class PairState:
-    disabled: bool = False  # ✅ cycle yok: kapandıktan sonra bu pair devre dışı kalır
+    disabled: bool = False  # no-cycle: once closed, pair is disabled
 
 
+# =========================
+# HELPERS
+# =========================
 def parse_pair_config(raw: str) -> List[PairRule]:
     """
     Format:
@@ -53,11 +57,27 @@ def parse_pair_config(raw: str) -> List[PairRule]:
             raise SystemExit(
                 f"PAIR_CONFIG parsing error. Each pair must be: SYM1|SYM2|TARGET|STOP. Got: {c}"
             )
+
         sym1, sym2 = parts[0].upper(), parts[1].upper()
         target = float(parts[2])
-        stop = float(parts[3])  # STOP negatif olmalı (örn -200)
-        rules.append(PairRule(sym1, sym2, target, stop))
+        stop = float(parts[3])  # stop should be negative (e.g. -200)
+
+        rules.append(PairRule(sym1=sym1, sym2=sym2, target_pnl=target, stop_pnl=stop))
+
     return rules
+
+
+def sync_time() -> None:
+    """
+    Fix Binance -1021 error by syncing local time to server time.
+    """
+    try:
+        server_time = client.futures_time()["serverTime"]
+        local_time = int(time.time() * 1000)
+        client.timestamp_offset = server_time - local_time
+        print(f"✅ Time synced. offset(ms)={client.timestamp_offset}")
+    except Exception as e:
+        print(f"⚠️ Time sync failed: {e}")
 
 
 def get_position_info(symbol: str) -> Tuple[float, float]:
@@ -66,7 +86,7 @@ def get_position_info(symbol: str) -> Tuple[float, float]:
       positionAmt: + long, - short, 0 no position
       unRealizedProfit: PnL (USDT/USDC)
     """
-    data = client.futures_position_information(symbol=symbol)
+    data = client.futures_position_information(symbol=symbol, recvWindow=RECV_WINDOW)
     pos = data[0]
     amt = float(pos["positionAmt"])
     pnl = float(pos["unRealizedProfit"])
@@ -91,14 +111,17 @@ def close_position_market(symbol: str, position_amt: float) -> None:
         side=side,
         type="MARKET",
         quantity=qty,
-        reduceOnly=True
+        reduceOnly=True,
+        recvWindow=RECV_WINDOW
     )
 
 
+# =========================
+# MAIN LOOP
+# =========================
 def main():
     rules = parse_pair_config(PAIR_CONFIG)
 
-    # state per pair
     states: Dict[str, PairState] = {}
     for r in rules:
         key = f"{r.sym1}/{r.sym2}"
@@ -108,7 +131,10 @@ def main():
     print("Pairs:")
     for r in rules:
         print(f"  - {r.sym1}/{r.sym2} | TP={r.target_pnl} | SL={r.stop_pnl}")
-    print(f"CHECK_SEC={CHECK_SEC} | POST_CLOSE_SLEEP_SEC={POST_CLOSE_SLEEP_SEC}")
+    print(f"CHECK_SEC={CHECK_SEC} | POST_CLOSE_SLEEP_SEC={POST_CLOSE_SLEEP_SEC} | RECV_WINDOW={RECV_WINDOW}")
+
+    # Initial time sync
+    sync_time()
 
     while True:
         try:
@@ -116,7 +142,7 @@ def main():
                 key = f"{r.sym1}/{r.sym2}"
                 st = states[key]
 
-                # ✅ Bu pair bir kez kapandıysa artık takip etmiyoruz (cycle yok)
+                # ✅ this pair is already closed once -> no cycle -> ignore
                 if st.disabled:
                     continue
 
@@ -131,13 +157,13 @@ def main():
                     f"TOTAL: {total:.2f} | TP={r.target_pnl} SL={r.stop_pnl}"
                 )
 
-                # Bu pairde pozisyon yoksa geç
+                # no position on this pair
                 if amt1 == 0 and amt2 == 0:
                     continue
 
-                # ✅ TP hit -> bu pair'i kapat + devre dışı bırak
+                # ✅ Take Profit: close this pair only, bot continues
                 if total >= r.target_pnl:
-                    print(f"✅ PAIR {key} TARGET HIT -> closing both legs (bot continues for others)...")
+                    print(f"✅ PAIR {key} TARGET HIT -> closing both legs (bot continues)...")
                     close_position_market(r.sym1, amt1)
                     close_position_market(r.sym2, amt2)
                     time.sleep(POST_CLOSE_SLEEP_SEC)
@@ -145,9 +171,9 @@ def main():
                     print(f"✅ PAIR {key} CLOSED and DISABLED (no cycle).")
                     continue
 
-                # ✅ SL hit -> bu pair'i kapat + devre dışı bırak
+                # ✅ Stop Loss: close this pair only, bot continues
                 if total <= r.stop_pnl:
-                    print(f"🛑 PAIR {key} STOP HIT -> closing both legs (bot continues for others)...")
+                    print(f"🛑 PAIR {key} STOP HIT -> closing both legs (bot continues)...")
                     close_position_market(r.sym1, amt1)
                     close_position_market(r.sym2, amt2)
                     time.sleep(POST_CLOSE_SLEEP_SEC)
@@ -158,8 +184,15 @@ def main():
             time.sleep(CHECK_SEC)
 
         except Exception as e:
+            msg = str(e)
             print(f"ERROR: {e}")
-            time.sleep(5)
+
+            # Binance timestamp error fix
+            if "code=-1021" in msg:
+                print("🔄 Timestamp issue detected (-1021). Re-syncing time...")
+                sync_time()
+
+            time.sleep(2)
 
 
 if __name__ == "__main__":
