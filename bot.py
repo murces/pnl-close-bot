@@ -23,12 +23,12 @@ TOP_N_COINS = int(os.getenv("TOP_N_COINS", "40"))
 SELECT_TOP_PAIRS = int(os.getenv("SELECT_TOP_PAIRS", "5"))
 
 BAR_INTERVAL = os.getenv("BAR_INTERVAL", "1m")
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "1440"))  # 1 day default
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "1440"))  # minutes of history
 
 ENTRY_Z = float(os.getenv("ENTRY_Z", "2.0"))
 EXIT_Z = float(os.getenv("EXIT_Z", "0.3"))
 
-MAX_USD_PER_LEG = float(os.getenv("MAX_USD_PER_LEG", "500"))
+BASE_USD_PER_LEG = float(os.getenv("BASE_USD_PER_LEG", "500"))  # per leg notional
 TP_USD = float(os.getenv("TP_USD", "25"))
 SL_USD = float(os.getenv("SL_USD", "-80"))
 MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "180"))
@@ -37,6 +37,11 @@ COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
 
 CHECK_SEC = int(os.getenv("CHECK_SEC", "10"))
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "60000"))
+
+# Futures settings (live mode)
+HEDGE_MODE = int(os.getenv("HEDGE_MODE", "0"))  # 0=one-way, 1=hedge (dual side)
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()  # ISOLATED / CROSSED
 
 client = Client(API_KEY, API_SECRET)
 
@@ -117,14 +122,37 @@ def get_step_min(symbol: str) -> Tuple[float, float]:
             raise RuntimeError(f"Symbol not found: {symbol}")
     return _LOT_CACHE[symbol]
 
-def round_qty(symbol: str, qty: float) -> float:
+def floor_to_step(symbol: str, qty: float) -> float:
     step, minq = get_step_min(symbol)
     if qty <= 0:
         return 0.0
-    rounded = math.floor(qty / step) * step
-    if rounded < minq:
+    q = math.floor(qty / step) * step
+    q = float(f"{q:.12f}")
+    if q < minq:
         return 0.0
-    return float(f"{rounded:.12f}")
+    return q
+
+def ensure_symbol_settings(symbol: str) -> None:
+    """
+    Live mode: set leverage and margin type.
+    Dry-run: do nothing (avoid accidental account changes).
+    """
+    if TRADING_ENABLED == 0:
+        return
+
+    # leverage
+    try:
+        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE, recvWindow=RECV_WINDOW)
+    except Exception as e:
+        print(f"⚠️ leverage set failed {symbol}: {e}")
+
+    # margin type
+    try:
+        client.futures_change_margin_type(symbol=symbol, marginType=MARGIN_TYPE, recvWindow=RECV_WINDOW)
+    except Exception as e:
+        msg = str(e).lower()
+        if "no need to change margin type" not in msg:
+            print(f"⚠️ margin type set failed {symbol}: {e}")
 
 def open_market(symbol: str, direction: int, usd: float) -> None:
     # DRY-RUN: no orders
@@ -133,13 +161,24 @@ def open_market(symbol: str, direction: int, usd: float) -> None:
         return
 
     price = get_mark(symbol)
-    qty = round_qty(symbol, usd / price)
+    qty = floor_to_step(symbol, usd / price)
     if qty <= 0:
         raise RuntimeError(f"[{symbol}] qty too small for usd={usd}")
+
     side = "BUY" if direction > 0 else "SELL"
-    client.futures_create_order(
-        symbol=symbol, side=side, type="MARKET", quantity=qty, recvWindow=RECV_WINDOW
+    params = dict(
+        symbol=symbol,
+        side=side,
+        type="MARKET",
+        quantity=qty,
+        recvWindow=RECV_WINDOW,
     )
+
+    # Hedge mode support
+    if HEDGE_MODE == 1:
+        params["positionSide"] = "LONG" if direction > 0 else "SHORT"
+
+    client.futures_create_order(**params)
 
 def close_market_reduce_only(symbol: str, position_amt: float) -> None:
     # DRY-RUN: no orders
@@ -149,19 +188,47 @@ def close_market_reduce_only(symbol: str, position_amt: float) -> None:
 
     if position_amt == 0:
         return
+
     side = "SELL" if position_amt > 0 else "BUY"
-    qty = abs(position_amt)
-    client.futures_create_order(
-        symbol=symbol, side=side, type="MARKET", quantity=qty, reduceOnly=True, recvWindow=RECV_WINDOW
+    qty = floor_to_step(symbol, abs(position_amt))
+    if qty <= 0:
+        return
+
+    params = dict(
+        symbol=symbol,
+        side=side,
+        type="MARKET",
+        quantity=qty,
+        reduceOnly=True,
+        recvWindow=RECV_WINDOW,
     )
+
+    if HEDGE_MODE == 1:
+        params["positionSide"] = "LONG" if position_amt > 0 else "SHORT"
+
+    client.futures_create_order(**params)
 
 # =========================
 # DATA / STATS
 # =========================
+def interval_to_minutes(interval: str) -> int:
+    interval = interval.strip().lower()
+    if interval.endswith("m"):
+        return int(interval[:-1])
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 60
+    if interval.endswith("d"):
+        return int(interval[:-1]) * 1440
+    raise ValueError(f"Unsupported interval: {interval}")
+
 def fetch_closes(symbol: str, interval: str, lookback_minutes: int) -> List[float]:
-    # Binance futures klines: limit max 1500.
-    # For 1m and 1440 minutes, it's ok (1440 bars).
-    limit = min(1500, max(50, lookback_minutes))
+    """
+    Convert lookback_minutes into number of bars for the given interval.
+    Binance limit max 1500.
+    """
+    mins = interval_to_minutes(interval)
+    bars = max(50, lookback_minutes // mins)
+    limit = min(1500, bars)
     kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
     return [float(k[4]) for k in kl]
 
@@ -272,10 +339,7 @@ def select_pairs(symbols: List[str], k: int) -> List[Pair]:
             scored.append((score, a, b))
 
     scored.sort(reverse=True, key=lambda x: x[0])
-    out = []
-    for score, a, b in scored[:k]:
-        out.append(Pair(a=a, b=b))
-    return out
+    return [Pair(a=a, b=b) for _, a, b in scored[:k]]
 
 # =========================
 # TRADING LOGIC
@@ -289,10 +353,10 @@ def compute_pair_z(pair: Pair) -> float:
     return zscore(ratio_series)
 
 def open_pair_market(pair: Pair, st: PairState, z: float) -> None:
-    # DRY-RUN: do not change state, do not send orders
+    # DRY-RUN: do not change exchange state / do not send orders
     if TRADING_ENABLED == 0:
         dir_a, dir_b = (-1, +1) if z >= 0 else (+1, -1)
-        print(f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | dirA={dir_a} dirB={dir_b} | usd/leg={MAX_USD_PER_LEG}")
+        print(f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | dirA={dir_a} dirB={dir_b} | usd/leg={BASE_USD_PER_LEG}")
         return
 
     # If z positive: ratio high -> short A, long B (expect ratio to fall)
@@ -301,9 +365,9 @@ def open_pair_market(pair: Pair, st: PairState, z: float) -> None:
     else:
         st.dir_a, st.dir_b = +1, -1
 
-    print(f"🚀 ENTRY {pair.a}/{pair.b} | z={z:.2f} | dirA={st.dir_a} dirB={st.dir_b} | usd/leg={MAX_USD_PER_LEG}")
-    open_market(pair.a, st.dir_a, MAX_USD_PER_LEG)
-    open_market(pair.b, st.dir_b, MAX_USD_PER_LEG)
+    print(f"🚀 ENTRY {pair.a}/{pair.b} | z={z:.2f} | dirA={st.dir_a} dirB={st.dir_b} | usd/leg={BASE_USD_PER_LEG}")
+    open_market(pair.a, st.dir_a, BASE_USD_PER_LEG)
+    open_market(pair.b, st.dir_b, BASE_USD_PER_LEG)
 
     st.open = True
     st.entry_time = time.time()
@@ -324,12 +388,12 @@ def main():
     sync_time()
 
     print("✅ Auto Pair Trading Bot (Taker-only, Unrealized PnL TP/SL)")
-    print(f"TRADING_ENABLED={TRADING_ENABLED}")
+    print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
+    print(f"BAR_INTERVAL={BAR_INTERVAL}, LOOKBACK_MINUTES={LOOKBACK_MINUTES}, CHECK_SEC={CHECK_SEC}")
     print(f"ENTRY_Z={ENTRY_Z}, EXIT_Z={EXIT_Z}, TP_USD={TP_USD}, SL_USD={SL_USD}, MAX_HOLD_MIN={MAX_HOLD_MIN}")
-    print(f"MAX_USD_PER_LEG={MAX_USD_PER_LEG}, MAX_OPEN_PAIRS={MAX_OPEN_PAIRS}, COOLDOWN_MIN={COOLDOWN_MIN}, CHECK_SEC={CHECK_SEC}")
+    print(f"BASE_USD_PER_LEG={BASE_USD_PER_LEG}, MAX_OPEN_PAIRS={MAX_OPEN_PAIRS}, COOLDOWN_MIN={COOLDOWN_MIN}")
 
-    # 1) select pairs on startup (MVP)
     symbols = get_universe_symbols(UNIVERSE_QUOTE, TOP_N_COINS)
     pairs = select_pairs(symbols, SELECT_TOP_PAIRS)
 
@@ -340,11 +404,21 @@ def main():
     for p in pairs:
         print(f"  - {p.a}/{p.b}")
 
+    # Live-mode: set leverage/margin settings for selected symbols
+    if TRADING_ENABLED == 1:
+        uniq = set()
+        for p in pairs:
+            uniq.add(p.a)
+            uniq.add(p.b)
+        for sym in sorted(uniq):
+            ensure_symbol_settings(sym)
+
     states: Dict[str, PairState] = {f"{p.a}/{p.b}": PairState() for p in pairs}
 
     while True:
         try:
             open_count = 0
+
             for p in pairs:
                 key = f"{p.a}/{p.b}"
                 st = states[key]
@@ -353,9 +427,13 @@ def main():
                 if st.last_close_time and (time.time() - st.last_close_time) < (COOLDOWN_MIN * 60):
                     continue
 
-                # read positions & pnl
                 amt_a, pnl_a = get_position(p.a)
                 amt_b, pnl_b = get_position(p.b)
+
+                # If dry-run and you already have positions, warn but do not touch
+                if TRADING_ENABLED == 0 and (amt_a != 0 or amt_b != 0):
+                    print(f"⚠️ DRY-RUN but positions exist for {key} | amtA={amt_a} amtB={amt_b} (no action)")
+                    continue
 
                 # safety: one leg open
                 if (amt_a == 0) != (amt_b == 0):
