@@ -55,6 +55,10 @@ HL_LOOKBACK = int(os.getenv("HL_LOOKBACK", "720"))
 HL_MIN_MIN = int(os.getenv("HL_MIN_MIN", "5"))
 HL_MAX_MIN = int(os.getenv("HL_MAX_MIN", "180"))
 
+# OLS quality filters
+R2_MIN = float(os.getenv("R2_MIN", "0.60"))
+BETA_MAX = float(os.getenv("BETA_MAX", "2.50"))
+
 client = Client(API_KEY, API_SECRET)
 
 # =========================
@@ -268,29 +272,49 @@ def mean_reversion_score(ratio_series: List[float]) -> float:
     return crossings / len(ratio_series)
 
 def log_prices(closes: List[float]) -> List[float]:
-    out = []
-    for c in closes:
-        out.append(math.log(c) if c > 0 else 0.0)
-    return out
+    return [math.log(c) if c > 0 else 0.0 for c in closes]
 
-def ols_beta_alpha(x: List[float], y: List[float]) -> Tuple[float, float]:
+def ols_beta_alpha_r2(x: List[float], y: List[float]) -> Tuple[float, float, Optional[float]]:
+    """
+    Regress: x = alpha + beta*y + e
+    Returns (beta, alpha, r2)
+    """
     n = min(len(x), len(y))
     if n < 50:
-        return 1.0, 0.0
+        return 1.0, 0.0, None
+
     x = x[-n:]
     y = y[-n:]
+
     mx = statistics.mean(x)
     my = statistics.mean(y)
+
     vy = sum((yi - my) ** 2 for yi in y) / n
     if vy == 0:
-        return 1.0, mx - my
+        return 1.0, mx - my, None
+
     cov = sum((x[i] - mx) * (y[i] - my) for i in range(n)) / n
     beta = cov / vy
-    alpha = mx - beta * my
     if not math.isfinite(beta):
         beta = 1.0
     beta = max(0.0, min(beta, 5.0))
-    return beta, alpha
+    alpha = mx - beta * my
+
+    # R^2
+    sst = sum((xi - mx) ** 2 for xi in x)
+    if sst <= 0:
+        return beta, alpha, None
+    sse = 0.0
+    for i in range(n):
+        pred = alpha + beta * y[i]
+        err = x[i] - pred
+        sse += err * err
+    r2 = 1.0 - (sse / sst)
+    if not math.isfinite(r2):
+        r2 = None
+    else:
+        r2 = max(0.0, min(1.0, r2))
+    return beta, alpha, r2
 
 def spread_series_from_prices(a_closes: List[float], b_closes: List[float], beta: float, alpha: float) -> List[float]:
     xa = log_prices(a_closes)
@@ -313,7 +337,7 @@ def half_life_minutes(spread: List[float], interval: str, lookback: int) -> Opti
     mins_per_bar = interval_to_minutes(interval)
     w = spread[-lookback:]
     s_lag = w[:-1]
-    ds = [w[i] - w[i-1] for i in range(1, len(w))]  # Δs_t aligned with s_{t-1}
+    ds = [w[i] - w[i - 1] for i in range(1, len(w))]
 
     n = len(ds)
     if n < 50:
@@ -326,9 +350,8 @@ def half_life_minutes(spread: List[float], interval: str, lookback: int) -> Opti
     if vx == 0:
         return None
     cov = sum((s_lag[i] - mx) * (ds[i] - my) for i in range(n)) / n
-    b = cov / vx  # slope
+    b = cov / vx
 
-    # need mean reversion: b negative and (1+b) between (0,1)
     if not math.isfinite(b):
         return None
     if b >= 0:
@@ -399,9 +422,9 @@ def select_pairs(symbols: List[str], k: int) -> List[Pair]:
 # =========================
 # SIGNAL
 # =========================
-def compute_signal(pair: Pair) -> Tuple[float, float, float, Optional[float]]:
+def compute_signal(pair: Pair) -> Tuple[float, float, float, Optional[float], Optional[float]]:
     """
-    Returns (z, beta, alpha, half_life_min)
+    Returns (z, beta, alpha, half_life_min, r2)
     """
     ca = fetch_closes(pair.a, BAR_INTERVAL, LOOKBACK_MINUTES)
     cb = fetch_closes(pair.b, BAR_INTERVAL, LOOKBACK_MINUTES)
@@ -415,16 +438,16 @@ def compute_signal(pair: Pair) -> Tuple[float, float, float, Optional[float]]:
 
         xa = log_prices(ca[-beta_lb:])
         yb = log_prices(cb[-beta_lb:])
-        beta, alpha = ols_beta_alpha(xa, yb)
+        beta, alpha, r2 = ols_beta_alpha_r2(xa, yb)
 
         spread = spread_series_from_prices(ca, cb, beta, alpha)
         z = zscore_last(spread, lookback=max(50, z_lb))
         hl = half_life_minutes(spread, BAR_INTERVAL, lookback=max(60, hl_lb))
-        return z, beta, alpha, hl
+        return z, beta, alpha, hl, r2
 
     ratio = [ca[i] / cb[i] if cb[i] != 0 else 0.0 for i in range(n)]
     z = zscore_last(ratio, lookback=max(50, min(ZSCORE_LOOKBACK, n)))
-    return z, 1.0, 0.0, None
+    return z, 1.0, 0.0, None, None
 
 # =========================
 # TRADING
@@ -473,13 +496,18 @@ def refresh_pairs() -> List[Pair]:
     new_pairs = select_pairs(symbols, SELECT_TOP_PAIRS)
     return new_pairs if new_pairs else []
 
+def fmt_opt(x: Optional[float], digits: int = 2) -> str:
+    if x is None:
+        return "na"
+    return f"{x:.{digits}f}"
+
 # =========================
 # MAIN
 # =========================
 def main():
     sync_time()
 
-    print("✅ Auto Pair Trading Bot (OLS Spread Z + Half-Life Filter + DRY State)")
+    print("✅ Auto Pair Trading Bot (OLS Spread Z + HL + R2/Beta Filters + DRY State)")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
     print(f"BAR_INTERVAL={BAR_INTERVAL}, LOOKBACK_MINUTES={LOOKBACK_MINUTES}, CHECK_SEC={CHECK_SEC}")
@@ -487,6 +515,7 @@ def main():
     print(f"BASE_USD_PER_LEG={BASE_USD_PER_LEG}, MAX_OPEN_PAIRS={MAX_OPEN_PAIRS}, COOLDOWN_MIN={COOLDOWN_MIN}")
     print(f"PAIR_REFRESH_MIN={PAIR_REFRESH_MIN} | SIGNAL_MODE={SIGNAL_MODE} | BETA_LOOKBACK={BETA_LOOKBACK} | ZSCORE_LOOKBACK={ZSCORE_LOOKBACK}")
     print(f"HL_LOOKBACK={HL_LOOKBACK} | HL_MIN_MIN={HL_MIN_MIN} | HL_MAX_MIN={HL_MAX_MIN}")
+    print(f"R2_MIN={R2_MIN} | BETA_MAX={BETA_MAX}")
 
     pairs = refresh_pairs()
     if not pairs:
@@ -552,9 +581,8 @@ def main():
 
                     if st.open:
                         held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
-                        z, beta, alpha, hl = compute_signal(p)
-                        hl_txt = f"{hl:.1f}m" if hl is not None else "na"
-                        print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | beta={beta:.3f} | hl={hl_txt} | held={held_min:.1f}m")
+                        z, beta, alpha, hl, r2 = compute_signal(p)
+                        print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
 
                         if total_pnl >= TP_USD:
                             close_pair(p, st, reason="TP_USD"); time.sleep(2); continue
@@ -569,14 +597,23 @@ def main():
                     if open_count >= MAX_OPEN_PAIRS:
                         continue
 
-                    z, beta, alpha, hl = compute_signal(p)
-                    hl_txt = f"{hl:.1f}m" if hl is not None else "na"
-                    print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f} | hl={hl_txt}")
+                    z, beta, alpha, hl, r2 = compute_signal(p)
+                    print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m")
 
                     if abs(z) >= ENTRY_Z:
+                        # Half-life gate
                         if hl is None or hl < HL_MIN_MIN or hl > HL_MAX_MIN:
-                            print(f"⛔ HL_FILTER {key} | hl={hl_txt} (min={HL_MIN_MIN} max={HL_MAX_MIN}) -> skip entry")
+                            print(f"⛔ HL_FILTER {key} | hl={fmt_opt(hl,1)}m (min={HL_MIN_MIN} max={HL_MAX_MIN}) -> skip entry")
                             continue
+                        # OLS quality gates (only meaningful in SPREAD_OLS)
+                        if SIGNAL_MODE == "SPREAD_OLS":
+                            if r2 is None or r2 < R2_MIN:
+                                print(f"⛔ R2_FILTER {key} | r2={fmt_opt(r2,2)} (min={R2_MIN}) -> skip entry")
+                                continue
+                            if beta > BETA_MAX:
+                                print(f"⛔ BETA_FILTER {key} | beta={beta:.3f} (max={BETA_MAX}) -> skip entry")
+                                continue
+
                         open_pair_market(p, st, z, beta, alpha)
                         open_count += 1
                         time.sleep(1)
@@ -585,9 +622,8 @@ def main():
                 # DRY: simulated engine
                 if st.open:
                     held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
-                    z, beta, alpha, hl = compute_signal(p)
-                    hl_txt = f"{hl:.1f}m" if hl is not None else "na"
-                    print(f"[DRY] PAIR {key} | z={z:.2f} | beta={beta:.3f} | hl={hl_txt} | held={held_min:.1f}m")
+                    z, beta, alpha, hl, r2 = compute_signal(p)
+                    print(f"[DRY] PAIR {key} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
 
                     if abs(z) <= EXIT_Z:
                         close_pair(p, st, reason="EXIT_Z"); time.sleep(1); continue
@@ -598,14 +634,21 @@ def main():
                 if open_count >= MAX_OPEN_PAIRS:
                     continue
 
-                z, beta, alpha, hl = compute_signal(p)
-                hl_txt = f"{hl:.1f}m" if hl is not None else "na"
-                print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f} | hl={hl_txt}")
+                z, beta, alpha, hl, r2 = compute_signal(p)
+                print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m")
 
                 if abs(z) >= ENTRY_Z:
                     if hl is None or hl < HL_MIN_MIN or hl > HL_MAX_MIN:
-                        print(f"⛔ HL_FILTER {key} | hl={hl_txt} (min={HL_MIN_MIN} max={HL_MAX_MIN}) -> skip entry")
+                        print(f"⛔ HL_FILTER {key} | hl={fmt_opt(hl,1)}m (min={HL_MIN_MIN} max={HL_MAX_MIN}) -> skip entry")
                         continue
+                    if SIGNAL_MODE == "SPREAD_OLS":
+                        if r2 is None or r2 < R2_MIN:
+                            print(f"⛔ R2_FILTER {key} | r2={fmt_opt(r2,2)} (min={R2_MIN}) -> skip entry")
+                            continue
+                        if beta > BETA_MAX:
+                            print(f"⛔ BETA_FILTER {key} | beta={beta:.3f} (max={BETA_MAX}) -> skip entry")
+                            continue
+
                     open_pair_market(p, st, z, beta, alpha)
                     open_count += 1
                     time.sleep(1)
