@@ -15,6 +15,9 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 if not API_KEY or not API_SECRET:
     raise SystemExit("Missing BINANCE_API_KEY / BINANCE_API_SECRET")
 
+# 0=dry-run (NO ORDERS), 1=live
+TRADING_ENABLED = int(os.getenv("TRADING_ENABLED", "0"))
+
 UNIVERSE_QUOTE = os.getenv("UNIVERSE_QUOTE", "USDT").upper()  # USDT or USDC
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "40"))
 SELECT_TOP_PAIRS = int(os.getenv("SELECT_TOP_PAIRS", "5"))
@@ -32,7 +35,7 @@ MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "180"))
 MAX_OPEN_PAIRS = int(os.getenv("MAX_OPEN_PAIRS", "3"))
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
 
-CHECK_SEC = int(os.getenv("CHECK_SEC", "5"))
+CHECK_SEC = int(os.getenv("CHECK_SEC", "10"))
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "60000"))
 
 client = Client(API_KEY, API_SECRET)
@@ -80,6 +83,7 @@ def is_valid_symbol(symbol: str) -> bool:
     try:
         return symbol in load_symbol_set()
     except Exception:
+        # if exchange_info fails temporarily, don't block the bot
         return True
 
 def get_mark(symbol: str) -> float:
@@ -123,6 +127,11 @@ def round_qty(symbol: str, qty: float) -> float:
     return float(f"{rounded:.12f}")
 
 def open_market(symbol: str, direction: int, usd: float) -> None:
+    # DRY-RUN: no orders
+    if TRADING_ENABLED == 0:
+        print(f"[DRY] open_market {symbol} dir={direction} usd={usd}")
+        return
+
     price = get_mark(symbol)
     qty = round_qty(symbol, usd / price)
     if qty <= 0:
@@ -133,6 +142,11 @@ def open_market(symbol: str, direction: int, usd: float) -> None:
     )
 
 def close_market_reduce_only(symbol: str, position_amt: float) -> None:
+    # DRY-RUN: no orders
+    if TRADING_ENABLED == 0:
+        print(f"[DRY] close_market {symbol} position_amt={position_amt}")
+        return
+
     if position_amt == 0:
         return
     side = "SELL" if position_amt > 0 else "BUY"
@@ -145,19 +159,19 @@ def close_market_reduce_only(symbol: str, position_amt: float) -> None:
 # DATA / STATS
 # =========================
 def fetch_closes(symbol: str, interval: str, lookback_minutes: int) -> List[float]:
-    # Binance futures klines: limit max 1500. For 1m and 1440 minutes, it's ok.
+    # Binance futures klines: limit max 1500.
+    # For 1m and 1440 minutes, it's ok (1440 bars).
     limit = min(1500, max(50, lookback_minutes))
     kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-    closes = [float(k[4]) for k in kl]
-    return closes
+    return [float(k[4]) for k in kl]
 
 def returns(series: List[float]) -> List[float]:
     out = []
     for i in range(1, len(series)):
-        if series[i-1] == 0:
+        if series[i - 1] == 0:
             out.append(0.0)
         else:
-            out.append((series[i] / series[i-1]) - 1.0)
+            out.append((series[i] / series[i - 1]) - 1.0)
     return out
 
 def corr(x: List[float], y: List[float]) -> float:
@@ -172,8 +186,8 @@ def corr(x: List[float], y: List[float]) -> float:
     sy = statistics.pstdev(y)
     if sx == 0 or sy == 0:
         return 0.0
-    cov = sum((x[i]-mx)*(y[i]-my) for i in range(n)) / n
-    return cov / (sx*sy)
+    cov = sum((x[i] - mx) * (y[i] - my) for i in range(n)) / n
+    return cov / (sx * sy)
 
 def zscore(series: List[float]) -> float:
     if len(series) < 50:
@@ -187,12 +201,11 @@ def zscore(series: List[float]) -> float:
 def mean_reversion_score(ratio_series: List[float]) -> float:
     """
     Simple score:
-      - higher when ratio zscore frequently crosses 0 (mean)
+      - higher when ratio frequently crosses its mean (mean-reverting behavior)
     """
     if len(ratio_series) < 100:
         return 0.0
     m = statistics.mean(ratio_series)
-    # count sign changes around mean
     crossings = 0
     prev = ratio_series[0] - m
     for v in ratio_series[1:]:
@@ -209,7 +222,7 @@ def get_universe_symbols(quote: str, top_n: int) -> List[str]:
     """
     Picks top_n symbols by 24h quoteVolume from futures tickers.
     """
-    tickers = client.futures_ticker()  # list of tickers
+    tickers = client.futures_ticker()
     candidates = []
     for t in tickers:
         sym = t.get("symbol", "")
@@ -217,7 +230,6 @@ def get_universe_symbols(quote: str, top_n: int) -> List[str]:
             continue
         if not is_valid_symbol(sym):
             continue
-        # exclude very weird symbols if needed
         try:
             qv = float(t.get("quoteVolume", 0.0))
         except Exception:
@@ -233,11 +245,9 @@ def select_pairs(symbols: List[str], k: int) -> List[Pair]:
     Pick top k.
     """
     scored = []
-    # limit combinations to keep runtime reasonable
-    max_syms = min(len(symbols), 25)  # keep MVP light
+    max_syms = min(len(symbols), 25)  # keep runtime reasonable
     base = symbols[:max_syms]
 
-    # fetch closes once
     closes_map: Dict[str, List[float]] = {}
     for s in base:
         try:
@@ -247,7 +257,7 @@ def select_pairs(symbols: List[str], k: int) -> List[Pair]:
 
     keys = list(closes_map.keys())
     for i in range(len(keys)):
-        for j in range(i+1, len(keys)):
+        for j in range(i + 1, len(keys)):
             a, b = keys[i], keys[j]
             ca, cb = closes_map[a], closes_map[b]
             n = min(len(ca), len(cb))
@@ -263,7 +273,7 @@ def select_pairs(symbols: List[str], k: int) -> List[Pair]:
 
     scored.sort(reverse=True, key=lambda x: x[0])
     out = []
-    for s, a, b in scored[:k]:
+    for score, a, b in scored[:k]:
         out.append(Pair(a=a, b=b))
     return out
 
@@ -279,6 +289,12 @@ def compute_pair_z(pair: Pair) -> float:
     return zscore(ratio_series)
 
 def open_pair_market(pair: Pair, st: PairState, z: float) -> None:
+    # DRY-RUN: do not change state, do not send orders
+    if TRADING_ENABLED == 0:
+        dir_a, dir_b = (-1, +1) if z >= 0 else (+1, -1)
+        print(f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | dirA={dir_a} dirB={dir_b} | usd/leg={MAX_USD_PER_LEG}")
+        return
+
     # If z positive: ratio high -> short A, long B (expect ratio to fall)
     if z >= 0:
         st.dir_a, st.dir_b = -1, +1
@@ -286,7 +302,6 @@ def open_pair_market(pair: Pair, st: PairState, z: float) -> None:
         st.dir_a, st.dir_b = +1, -1
 
     print(f"🚀 ENTRY {pair.a}/{pair.b} | z={z:.2f} | dirA={st.dir_a} dirB={st.dir_b} | usd/leg={MAX_USD_PER_LEG}")
-    # taker-only, send both
     open_market(pair.a, st.dir_a, MAX_USD_PER_LEG)
     open_market(pair.b, st.dir_b, MAX_USD_PER_LEG)
 
@@ -294,6 +309,11 @@ def open_pair_market(pair: Pair, st: PairState, z: float) -> None:
     st.entry_time = time.time()
 
 def close_pair(pair: Pair) -> None:
+    # DRY-RUN: no orders
+    if TRADING_ENABLED == 0:
+        print(f"[DRY] EXIT {pair.a}/{pair.b}")
+        return
+
     amt_a, _ = get_position(pair.a)
     amt_b, _ = get_position(pair.b)
     print(f"🧯 EXIT {pair.a}/{pair.b} | closing | amtA={amt_a} amtB={amt_b}")
@@ -304,6 +324,7 @@ def main():
     sync_time()
 
     print("✅ Auto Pair Trading Bot (Taker-only, Unrealized PnL TP/SL)")
+    print(f"TRADING_ENABLED={TRADING_ENABLED}")
     print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
     print(f"ENTRY_Z={ENTRY_Z}, EXIT_Z={EXIT_Z}, TP_USD={TP_USD}, SL_USD={SL_USD}, MAX_HOLD_MIN={MAX_HOLD_MIN}")
     print(f"MAX_USD_PER_LEG={MAX_USD_PER_LEG}, MAX_OPEN_PAIRS={MAX_OPEN_PAIRS}, COOLDOWN_MIN={COOLDOWN_MIN}, CHECK_SEC={CHECK_SEC}")
@@ -346,7 +367,7 @@ def main():
 
                 total_pnl = pnl_a + pnl_b
 
-                # infer open state from exchange if needed
+                # infer open state from exchange
                 if amt_a != 0 and amt_b != 0:
                     st.open = True
                     open_count += 1
@@ -356,7 +377,6 @@ def main():
                 # If open -> exit checks
                 if st.open:
                     held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
-                    # z for exit (mean reversion)
                     z = compute_pair_z(p)
 
                     print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | held={held_min:.1f}m")
@@ -404,7 +424,7 @@ def main():
 
                 if abs(z) >= ENTRY_Z:
                     open_pair_market(p, st, z)
-                    time.sleep(1)  # small spacing
+                    time.sleep(1)
                     continue
 
             time.sleep(CHECK_SEC)
