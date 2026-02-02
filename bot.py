@@ -57,7 +57,7 @@ client = Client(API_KEY, API_SECRET)
 # =========================
 _SYMBOL_SET: Optional[set] = None
 _LOT_CACHE: Dict[str, Tuple[float, float]] = {}
-_KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, List[float]]] = {}  # (sym, interval, limit) -> (last_open_ms, closes)
+_KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, List[float]]] = {}
 
 # =========================
 # DATA
@@ -156,14 +156,11 @@ def ensure_symbol_settings(symbol: str) -> None:
 
 def open_market(symbol: str, direction: int, usd: float) -> None:
     if TRADING_ENABLED == 0:
-        print(f"[DRY] open_market {symbol} dir={direction} usd={usd:.2f}")
         return
-
     price = get_mark(symbol)
     qty = floor_to_step(symbol, usd / price)
     if qty <= 0:
         raise RuntimeError(f"[{symbol}] qty too small for usd={usd}")
-
     side = "BUY" if direction > 0 else "SELL"
     params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, recvWindow=RECV_WINDOW)
     if HEDGE_MODE == 1:
@@ -172,17 +169,13 @@ def open_market(symbol: str, direction: int, usd: float) -> None:
 
 def close_market_reduce_only(symbol: str, position_amt: float) -> None:
     if TRADING_ENABLED == 0:
-        print(f"[DRY] close_market {symbol} position_amt={position_amt}")
         return
-
     if position_amt == 0:
         return
-
     side = "SELL" if position_amt > 0 else "BUY"
     qty = floor_to_step(symbol, abs(position_amt))
     if qty <= 0:
         return
-
     params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, reduceOnly=True, recvWindow=RECV_WINDOW)
     if HEDGE_MODE == 1:
         params["positionSide"] = "LONG" if position_amt > 0 else "SHORT"
@@ -272,17 +265,10 @@ def mean_reversion_score(ratio_series: List[float]) -> float:
 def log_prices(closes: List[float]) -> List[float]:
     out = []
     for c in closes:
-        if c <= 0:
-            out.append(0.0)
-        else:
-            out.append(math.log(c))
+        out.append(math.log(c) if c > 0 else 0.0)
     return out
 
 def ols_beta_alpha(x: List[float], y: List[float]) -> Tuple[float, float]:
-    """
-    x ~ alpha + beta*y
-    Return (beta, alpha)
-    """
     n = min(len(x), len(y))
     if n < 50:
         return 1.0, 0.0
@@ -296,7 +282,6 @@ def ols_beta_alpha(x: List[float], y: List[float]) -> Tuple[float, float]:
     cov = sum((x[i] - mx) * (y[i] - my) for i in range(n)) / n
     beta = cov / vy
     alpha = mx - beta * my
-    # guardrails
     if not math.isfinite(beta):
         beta = 1.0
     beta = max(0.0, min(beta, 5.0))
@@ -330,7 +315,7 @@ def get_universe_symbols(quote: str, top_n: int) -> List[str]:
     candidates.sort(reverse=True, key=lambda x: x[0])
     return [s for _, s in candidates[:top_n]]
 
-def select_pairs(symbols: List[str], k: int) -> List[Pair]:
+def select_pairs(symbols: List[str], k: int) -> List["Pair"]:
     scored = []
     max_syms = min(len(symbols), 25)
     base = symbols[:max_syms]
@@ -364,19 +349,15 @@ def select_pairs(symbols: List[str], k: int) -> List[Pair]:
     return [Pair(a=a, b=b) for _, a, b in scored[:k]]
 
 # =========================
-# TRADING LOGIC
+# SIGNAL
 # =========================
 def compute_signal(pair: Pair) -> Tuple[float, float, float]:
-    """
-    Returns (z, beta, alpha)
-    """
     ca = fetch_closes(pair.a, BAR_INTERVAL, LOOKBACK_MINUTES)
     cb = fetch_closes(pair.b, BAR_INTERVAL, LOOKBACK_MINUTES)
     n = min(len(ca), len(cb))
     ca, cb = ca[-n:], cb[-n:]
 
     if SIGNAL_MODE == "SPREAD_OLS":
-        # use lookbacks
         beta_lb = min(BETA_LOOKBACK, n)
         z_lb = min(ZSCORE_LOOKBACK, n)
 
@@ -388,46 +369,51 @@ def compute_signal(pair: Pair) -> Tuple[float, float, float]:
         z = zscore_last(spread, lookback=max(50, z_lb))
         return z, beta, alpha
 
-    # fallback: ratio z
     ratio = [ca[i] / cb[i] if cb[i] != 0 else 0.0 for i in range(n)]
     z = zscore_last(ratio, lookback=max(50, min(ZSCORE_LOOKBACK, n)))
     return z, 1.0, 0.0
 
+# =========================
+# TRADING
+# =========================
 def open_pair_market(pair: Pair, st: PairState, z: float, beta: float, alpha: float) -> None:
-    # z>0: A rich -> short A, long B
     if z >= 0:
         dir_a, dir_b = -1, +1
     else:
         dir_a, dir_b = +1, -1
 
-    # hedge sizing: B leg notional scaled by beta (clamp)
     beta_eff = max(0.25, min(beta, 4.0))
     usd_a = BASE_USD_PER_LEG
     usd_b = BASE_USD_PER_LEG * beta_eff
+
+    # IMPORTANT: even in DRY mode, set state so behavior matches live
+    st.dir_a, st.dir_b = dir_a, dir_b
+    st.beta, st.alpha = beta_eff, alpha
+    st.open = True
+    st.entry_time = time.time()
 
     if TRADING_ENABLED == 0:
         print(f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
               f"dirA={dir_a} usdA={usd_a:.2f} | dirB={dir_b} usdB={usd_b:.2f}")
         return
 
-    st.dir_a, st.dir_b = dir_a, dir_b
-    st.beta, st.alpha = beta_eff, alpha
     print(f"🚀 ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
           f"dirA={dir_a} usdA={usd_a:.2f} | dirB={dir_b} usdB={usd_b:.2f}")
-
     open_market(pair.a, dir_a, usd_a)
     open_market(pair.b, dir_b, usd_b)
-    st.open = True
-    st.entry_time = time.time()
 
-def close_pair(pair: Pair) -> None:
+def close_pair(pair: Pair, st: PairState, reason: str) -> None:
+    # IMPORTANT: even in DRY mode, clear state
+    st.open = False
+    st.last_close_time = time.time()
+
     if TRADING_ENABLED == 0:
-        print(f"[DRY] EXIT {pair.a}/{pair.b}")
+        print(f"[DRY] EXIT {pair.a}/{pair.b} | reason={reason}")
         return
 
     amt_a, _ = get_position(pair.a)
     amt_b, _ = get_position(pair.b)
-    print(f"🧯 EXIT {pair.a}/{pair.b} | closing | amtA={amt_a} amtB={amt_b}")
+    print(f"🧯 EXIT {pair.a}/{pair.b} | reason={reason} | amtA={amt_a} amtB={amt_b}")
     close_market_reduce_only(pair.a, amt_a)
     close_market_reduce_only(pair.b, amt_b)
 
@@ -436,10 +422,13 @@ def refresh_pairs() -> List[Pair]:
     new_pairs = select_pairs(symbols, SELECT_TOP_PAIRS)
     return new_pairs if new_pairs else []
 
+# =========================
+# MAIN
+# =========================
 def main():
     sync_time()
 
-    print("✅ Auto Pair Trading Bot (OLS Spread Z + Refresh)")
+    print("✅ Auto Pair Trading Bot (OLS Spread Z + Refresh + DRY State)")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
     print(f"BAR_INTERVAL={BAR_INTERVAL}, LOOKBACK_MINUTES={LOOKBACK_MINUTES}, CHECK_SEC={CHECK_SEC}")
@@ -467,17 +456,12 @@ def main():
 
     while True:
         try:
-            open_count = 0
+            open_count = sum(1 for s in states.values() if s.open)
 
-            any_positions = False
-            for p in pairs:
-                amt_a, _ = get_position(p.a)
-                amt_b, _ = get_position(p.b)
-                if amt_a != 0 or amt_b != 0:
-                    any_positions = True
-                    break
+            # Block refresh while any open (DRY or LIVE)
+            any_open_state = any(s.open for s in states.values())
 
-            if (time.time() - last_refresh_ts) >= (PAIR_REFRESH_MIN * 60) and not any_positions:
+            if (time.time() - last_refresh_ts) >= (PAIR_REFRESH_MIN * 60) and not any_open_state:
                 print("🔄 REFRESH: selecting new pairs...")
                 new_pairs = refresh_pairs()
                 if new_pairs:
@@ -498,60 +482,62 @@ def main():
 
             for p in pairs:
                 key = f"{p.a}/{p.b}"
-                st = states.get(key)
-                if st is None:
-                    st = PairState()
-                    states[key] = st
+                st = states.setdefault(key, PairState())
 
+                # cooldown after close
                 if st.last_close_time and (time.time() - st.last_close_time) < (COOLDOWN_MIN * 60):
                     continue
 
-                amt_a, pnl_a = get_position(p.a)
-                amt_b, pnl_b = get_position(p.b)
+                # LIVE: sync open state from exchange truth
+                if TRADING_ENABLED == 1:
+                    amt_a, pnl_a = get_position(p.a)
+                    amt_b, pnl_b = get_position(p.b)
 
-                if TRADING_ENABLED == 0 and (amt_a != 0 or amt_b != 0):
-                    print(f"⚠️ DRY-RUN but positions exist for {key} | amtA={amt_a} amtB={amt_b} (no action)")
+                    if (amt_a == 0) != (amt_b == 0):
+                        print(f"⚠️ ONE-LEG RISK {key} | amtA={amt_a} amtB={amt_b} -> forcing close")
+                        close_pair(p, st, reason="ONE_LEG_RISK")
+                        continue
+
+                    total_pnl = pnl_a + pnl_b
+                    st.open = (amt_a != 0 and amt_b != 0)
+
+                    if st.open:
+                        held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
+                        z, beta, alpha = compute_signal(p)
+                        print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | beta={beta:.3f} | held={held_min:.1f}m")
+
+                        if total_pnl >= TP_USD:
+                            close_pair(p, st, reason="TP_USD"); time.sleep(2); continue
+                        if total_pnl <= SL_USD:
+                            close_pair(p, st, reason="SL_USD"); time.sleep(2); continue
+                        if abs(z) <= EXIT_Z:
+                            close_pair(p, st, reason="EXIT_Z"); time.sleep(2); continue
+                        if held_min >= MAX_HOLD_MIN:
+                            close_pair(p, st, reason="TIME_STOP"); time.sleep(2); continue
+
+                        continue
+
+                    # flat -> entry
+                    if open_count >= MAX_OPEN_PAIRS:
+                        continue
+                    z, beta, alpha = compute_signal(p)
+                    print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f}")
+                    if abs(z) >= ENTRY_Z:
+                        open_pair_market(p, st, z, beta, alpha)
+                        open_count += 1
+                        time.sleep(1)
                     continue
 
-                if (amt_a == 0) != (amt_b == 0):
-                    print(f"⚠️ ONE-LEG RISK {key} | amtA={amt_a} amtB={amt_b} -> forcing close remaining leg")
-                    close_pair(p)
-                    st.open = False
-                    st.last_close_time = time.time()
-                    continue
-
-                total_pnl = pnl_a + pnl_b
-
-                if amt_a != 0 and amt_b != 0:
-                    st.open = True
-                    open_count += 1
-                else:
-                    st.open = False
-
+                # DRY: simulated engine (no exchange calls)
                 if st.open:
                     held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
                     z, beta, alpha = compute_signal(p)
-                    print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | beta={beta:.3f} | held={held_min:.1f}m")
-
-                    if total_pnl >= TP_USD:
-                        print(f"✅ TP HIT {key} -> close")
-                        close_pair(p); st.open = False; st.last_close_time = time.time()
-                        time.sleep(2); continue
-
-                    if total_pnl <= SL_USD:
-                        print(f"🛑 SL HIT {key} -> close")
-                        close_pair(p); st.open = False; st.last_close_time = time.time()
-                        time.sleep(2); continue
+                    print(f"[DRY] PAIR {key} | z={z:.2f} | beta={beta:.3f} | held={held_min:.1f}m")
 
                     if abs(z) <= EXIT_Z:
-                        print(f"✅ EXIT_Z HIT {key} -> close")
-                        close_pair(p); st.open = False; st.last_close_time = time.time()
-                        time.sleep(2); continue
-
+                        close_pair(p, st, reason="EXIT_Z"); time.sleep(1); continue
                     if held_min >= MAX_HOLD_MIN:
-                        print(f"⏳ TIME STOP {key} -> close")
-                        close_pair(p); st.open = False; st.last_close_time = time.time()
-                        time.sleep(2); continue
+                        close_pair(p, st, reason="TIME_STOP"); time.sleep(1); continue
 
                     continue
 
@@ -560,9 +546,9 @@ def main():
 
                 z, beta, alpha = compute_signal(p)
                 print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f}")
-
                 if abs(z) >= ENTRY_Z:
                     open_pair_market(p, st, z, beta, alpha)
+                    open_count += 1
                     time.sleep(1)
 
             time.sleep(CHECK_SEC)
