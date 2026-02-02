@@ -91,7 +91,7 @@ class PairState:
     beta: float = 1.0
     alpha: float = 0.0
     entry_abs_z: float = 0.0
-    peak_abs_z: float = 0.0  # <-- NEW: worst abs(z) seen since entry
+    peak_abs_z: float = 0.0  # worst abs(z) seen since entry
 
 # =========================
 # BINANCE HELPERS
@@ -413,7 +413,30 @@ def select_pairs(symbols: List[str], k: int) -> List["Pair"]:
             scored.append((score, a, b))
 
     scored.sort(reverse=True, key=lambda x: x[0])
-    return [Pair(a=a, b=b) for _, a, b in scored[:k]]
+
+    # ---- NEW: overlap-reduced greedy selection ----
+    selected: List[Pair] = []
+    used = set()
+
+    # 1) prefer pairs without coin overlap
+    for _, a, b in scored:
+        if a in used or b in used:
+            continue
+        selected.append(Pair(a=a, b=b))
+        used.add(a); used.add(b)
+        if len(selected) >= k:
+            break
+
+    # 2) if not enough pairs, allow overlap to fill
+    if len(selected) < k:
+        for _, a, b in scored:
+            if any((x.a == a and x.b == b) for x in selected):
+                continue
+            selected.append(Pair(a=a, b=b))
+            if len(selected) >= k:
+                break
+
+    return selected
 
 def refresh_pairs() -> List["Pair"]:
     symbols = get_universe_symbols(UNIVERSE_QUOTE, TOP_N_COINS)
@@ -470,15 +493,19 @@ def open_pair_market(pair: Pair, st: PairState, z: float, beta: float, alpha: fl
 
     absz = abs(z)
     st.entry_abs_z = absz
-    st.peak_abs_z = absz  # <-- init peak
+    st.peak_abs_z = absz
 
     if TRADING_ENABLED == 0:
-        print(f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
-              f"dirA={dir_a} usdA={usd_a:.2f} | dirB={dir_b} usdB={usd_b:.2f}")
+        print(
+            f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
+            f"dirA={dir_a} usdA={usd_a:.2f} | dirB={dir_b} usdB={usd_b:.2f}"
+        )
         return
 
-    print(f"🚀 ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
-          f"dirA={dir_a} usdA={usd_a:.2f} | dirB={dir_b} usdB={usd_b:.2f}")
+    print(
+        f"🚀 ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
+        f"dirA={dir_a} usdA={usd_a:.2f} | dirB={dir_b} usdB={usd_b:.2f}"
+    )
     open_market(pair.a, dir_a, usd_a)
     open_market(pair.b, dir_b, usd_b)
 
@@ -505,13 +532,27 @@ def should_no_progress_exit(st: PairState, abs_z_now: float, held_min: float) ->
     improve_from_peak = (peak - abs_z_now) / peak
     return improve_from_peak < MIN_IMPROVE_PCT
 
+# ---- NEW: overlap helper ----
+def get_open_symbols(pairs: List[Pair], states: Dict[str, PairState]) -> set:
+    """
+    Currently OPEN pairs' symbols set.
+    """
+    s = set()
+    for p in pairs:
+        key = f"{p.a}/{p.b}"
+        st = states.get(key)
+        if st and st.open:
+            s.add(p.a)
+            s.add(p.b)
+    return s
+
 # =========================
 # MAIN
 # =========================
 def main():
     sync_time()
 
-    print("✅ Auto Pair Trading Bot (OLS Spread Z + HL + R2/Beta Filters + Dynamic Exits (Peak) + DRY State)")
+    print("✅ Auto Pair Trading Bot (OLS Spread Z + HL + R2/Beta Filters + Dynamic Exits (Peak) + DRY State + OVERLAP GUARD)")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
     print(f"BAR_INTERVAL={BAR_INTERVAL}, LOOKBACK_MINUTES={LOOKBACK_MINUTES}, CHECK_SEC={CHECK_SEC}")
@@ -588,11 +629,13 @@ def main():
                         held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
                         z, beta, alpha, hl, r2 = compute_signal(p)
                         abs_z = abs(z)
-                        st.peak_abs_z = max(st.peak_abs_z, abs_z)  # <-- peak update
+                        st.peak_abs_z = max(st.peak_abs_z, abs_z)
 
-                        print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | absz={abs_z:.2f} | "
-                              f"entryAbsZ={st.entry_abs_z:.2f} | peakAbsZ={st.peak_abs_z:.2f} | "
-                              f"beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
+                        print(
+                            f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | absz={abs_z:.2f} | "
+                            f"entryAbsZ={st.entry_abs_z:.2f} | peakAbsZ={st.peak_abs_z:.2f} | "
+                            f"beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m"
+                        )
 
                         if total_pnl >= TP_USD:
                             close_pair(p, st, reason="TP_USD"); time.sleep(2); continue
@@ -629,6 +672,12 @@ def main():
                                 print(f"⛔ BETA_FILTER {key} | beta={beta:.3f} (max={BETA_MAX}) -> skip entry")
                                 continue
 
+                        # ---- NEW: overlap guard (LIVE) ----
+                        open_syms = get_open_symbols(pairs, states)
+                        if (p.a in open_syms) or (p.b in open_syms):
+                            print(f"⛔ OVERLAP_SKIP {key} | openSymbols={sorted(list(open_syms))} -> skip entry")
+                            continue
+
                         open_pair_market(p, st, z, beta, alpha)
                         open_count += 1
                         time.sleep(1)
@@ -639,11 +688,13 @@ def main():
                     held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
                     z, beta, alpha, hl, r2 = compute_signal(p)
                     abs_z = abs(z)
-                    st.peak_abs_z = max(st.peak_abs_z, abs_z)  # <-- peak update
+                    st.peak_abs_z = max(st.peak_abs_z, abs_z)
 
-                    print(f"[DRY] PAIR {key} | z={z:.2f} | absz={abs_z:.2f} | entryAbsZ={st.entry_abs_z:.2f} | "
-                          f"peakAbsZ={st.peak_abs_z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | "
-                          f"hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
+                    print(
+                        f"[DRY] PAIR {key} | z={z:.2f} | absz={abs_z:.2f} | entryAbsZ={st.entry_abs_z:.2f} | "
+                        f"peakAbsZ={st.peak_abs_z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | "
+                        f"hl={fmt_opt(hl,1)}m | held={held_min:.1f}m"
+                    )
 
                     if abs_z <= EXIT_Z:
                         close_pair(p, st, reason="EXIT_Z"); time.sleep(1); continue
@@ -673,6 +724,12 @@ def main():
                         if beta > BETA_MAX:
                             print(f"⛔ BETA_FILTER {key} | beta={beta:.3f} (max={BETA_MAX}) -> skip entry")
                             continue
+
+                    # ---- NEW: overlap guard (DRY) ----
+                    open_syms = get_open_symbols(pairs, states)
+                    if (p.a in open_syms) or (p.b in open_syms):
+                        print(f"⛔ OVERLAP_SKIP {key} | openSymbols={sorted(list(open_syms))} -> skip entry")
+                        continue
 
                     open_pair_market(p, st, z, beta, alpha)
                     open_count += 1
