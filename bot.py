@@ -30,7 +30,7 @@ EXIT_Z = float(os.getenv("EXIT_Z", "0.3"))
 BASE_USD_PER_LEG = float(os.getenv("BASE_USD_PER_LEG", "500"))
 TP_USD = float(os.getenv("TP_USD", "25"))
 SL_USD = float(os.getenv("SL_USD", "-80"))
-MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "180"))
+MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "120"))  # <-- set via env
 MAX_OPEN_PAIRS = int(os.getenv("MAX_OPEN_PAIRS", "3"))
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
 
@@ -59,6 +59,11 @@ HL_MAX_MIN = int(os.getenv("HL_MAX_MIN", "180"))
 R2_MIN = float(os.getenv("R2_MIN", "0.60"))
 BETA_MAX = float(os.getenv("BETA_MAX", "2.50"))
 
+# Dynamic exits (z behavior)
+NO_PROGRESS_MIN = int(os.getenv("NO_PROGRESS_MIN", "20"))
+MIN_IMPROVE_PCT = float(os.getenv("MIN_IMPROVE_PCT", "0.20"))  # 20%
+Z_STOP = float(os.getenv("Z_STOP", "3.5"))
+
 client = Client(API_KEY, API_SECRET)
 
 # =========================
@@ -85,6 +90,7 @@ class PairState:
     dir_b: int = 0
     beta: float = 1.0
     alpha: float = 0.0
+    entry_abs_z: float = 0.0  # <-- NEW: remember abs(z) at entry
 
 # =========================
 # BINANCE HELPERS
@@ -224,30 +230,6 @@ def fetch_closes(symbol: str, interval: str, lookback_minutes: int) -> List[floa
     _KLINE_CACHE[cache_key] = (last_open_time, closes)
     return closes
 
-def returns(series: List[float]) -> List[float]:
-    out = []
-    for i in range(1, len(series)):
-        if series[i - 1] == 0:
-            out.append(0.0)
-        else:
-            out.append((series[i] / series[i - 1]) - 1.0)
-    return out
-
-def corr(x: List[float], y: List[float]) -> float:
-    n = min(len(x), len(y))
-    if n < 30:
-        return 0.0
-    x = x[-n:]
-    y = y[-n:]
-    mx = statistics.mean(x)
-    my = statistics.mean(y)
-    sx = statistics.pstdev(x)
-    sy = statistics.pstdev(y)
-    if sx == 0 or sy == 0:
-        return 0.0
-    cov = sum((x[i] - mx) * (y[i] - my) for i in range(n)) / n
-    return cov / (sx * sy)
-
 def zscore_last(series: List[float], lookback: int) -> float:
     if len(series) < max(50, lookback):
         return 0.0
@@ -258,34 +240,16 @@ def zscore_last(series: List[float], lookback: int) -> float:
         return 0.0
     return (w[-1] - m) / s
 
-def mean_reversion_score(ratio_series: List[float]) -> float:
-    if len(ratio_series) < 100:
-        return 0.0
-    m = statistics.mean(ratio_series)
-    crossings = 0
-    prev = ratio_series[0] - m
-    for v in ratio_series[1:]:
-        cur = v - m
-        if (prev <= 0 < cur) or (prev >= 0 > cur):
-            crossings += 1
-        prev = cur
-    return crossings / len(ratio_series)
-
 def log_prices(closes: List[float]) -> List[float]:
     return [math.log(c) if c > 0 else 0.0 for c in closes]
 
 def ols_beta_alpha_r2(x: List[float], y: List[float]) -> Tuple[float, float, Optional[float]]:
-    """
-    Regress: x = alpha + beta*y + e
-    Returns (beta, alpha, r2)
-    """
     n = min(len(x), len(y))
     if n < 50:
         return 1.0, 0.0, None
 
     x = x[-n:]
     y = y[-n:]
-
     mx = statistics.mean(x)
     my = statistics.mean(y)
 
@@ -300,7 +264,6 @@ def ols_beta_alpha_r2(x: List[float], y: List[float]) -> Tuple[float, float, Opt
     beta = max(0.0, min(beta, 5.0))
     alpha = mx - beta * my
 
-    # R^2
     sst = sum((xi - mx) ** 2 for xi in x)
     if sst <= 0:
         return beta, alpha, None
@@ -325,12 +288,6 @@ def spread_series_from_prices(a_closes: List[float], b_closes: List[float], beta
     return [xa[i] - (alpha + beta * yb[i]) for i in range(n)]
 
 def half_life_minutes(spread: List[float], interval: str, lookback: int) -> Optional[float]:
-    """
-    Estimate mean reversion half-life via AR(1):
-      Δs_t = a + b * s_{t-1} + e_t
-    Half-life (bars) = -ln(2) / ln(1+b)  (for -1<b<0)
-    Convert to minutes using interval.
-    """
     if len(spread) < max(60, lookback):
         return None
 
@@ -352,9 +309,7 @@ def half_life_minutes(spread: List[float], interval: str, lookback: int) -> Opti
     cov = sum((s_lag[i] - mx) * (ds[i] - my) for i in range(n)) / n
     b = cov / vx
 
-    if not math.isfinite(b):
-        return None
-    if b >= 0:
+    if not math.isfinite(b) or b >= 0:
         return None
     one_plus_b = 1.0 + b
     if one_plus_b <= 0 or one_plus_b >= 1:
@@ -365,6 +320,11 @@ def half_life_minutes(spread: List[float], interval: str, lookback: int) -> Opti
         return None
 
     return hl_bars * mins_per_bar
+
+def fmt_opt(x: Optional[float], digits: int = 2) -> str:
+    if x is None:
+        return "na"
+    return f"{x:.{digits}f}"
 
 # =========================
 # PAIR SELECTION
@@ -386,7 +346,44 @@ def get_universe_symbols(quote: str, top_n: int) -> List[str]:
     candidates.sort(reverse=True, key=lambda x: x[0])
     return [s for _, s in candidates[:top_n]]
 
-def select_pairs(symbols: List[str], k: int) -> List[Pair]:
+def returns(series: List[float]) -> List[float]:
+    out = []
+    for i in range(1, len(series)):
+        if series[i - 1] == 0:
+            out.append(0.0)
+        else:
+            out.append((series[i] / series[i - 1]) - 1.0)
+    return out
+
+def corr(x: List[float], y: List[float]) -> float:
+    n = min(len(x), len(y))
+    if n < 30:
+        return 0.0
+    x = x[-n:]
+    y = y[-n:]
+    mx = statistics.mean(x)
+    my = statistics.mean(y)
+    sx = statistics.pstdev(x)
+    sy = statistics.pstdev(y)
+    if sx == 0 or sy == 0:
+        return 0.0
+    cov = sum((x[i] - mx) * (y[i] - my) for i in range(n)) / n
+    return cov / (sx * sy)
+
+def mean_reversion_score(ratio_series: List[float]) -> float:
+    if len(ratio_series) < 100:
+        return 0.0
+    m = statistics.mean(ratio_series)
+    crossings = 0
+    prev = ratio_series[0] - m
+    for v in ratio_series[1:]:
+        cur = v - m
+        if (prev <= 0 < cur) or (prev >= 0 > cur):
+            crossings += 1
+        prev = cur
+    return crossings / len(ratio_series)
+
+def select_pairs(symbols: List[str], k: int) -> List["Pair"]:
     scored = []
     max_syms = min(len(symbols), 25)
     base = symbols[:max_syms]
@@ -409,22 +406,25 @@ def select_pairs(symbols: List[str], k: int) -> List[Pair]:
             ca, cb = ca[-n:], cb[-n:]
             ra, rb = returns(ca), returns(cb)
             c = abs(corr(ra, rb))
-
             ratio_series = [ca[x] / cb[x] if cb[x] != 0 else 0.0 for x in range(n)]
             mr = mean_reversion_score(ratio_series)
-
             score = 0.7 * c + 0.3 * mr
             scored.append((score, a, b))
 
     scored.sort(reverse=True, key=lambda x: x[0])
     return [Pair(a=a, b=b) for _, a, b in scored[:k]]
 
+def refresh_pairs() -> List["Pair"]:
+    symbols = get_universe_symbols(UNIVERSE_QUOTE, TOP_N_COINS)
+    new_pairs = select_pairs(symbols, SELECT_TOP_PAIRS)
+    return new_pairs if new_pairs else []
+
 # =========================
 # SIGNAL
 # =========================
 def compute_signal(pair: Pair) -> Tuple[float, float, float, Optional[float], Optional[float]]:
     """
-    Returns (z, beta, alpha, half_life_min, r2)
+    Returns (z, beta, alpha, hl_minutes, r2)
     """
     ca = fetch_closes(pair.a, BAR_INTERVAL, LOOKBACK_MINUTES)
     cb = fetch_closes(pair.b, BAR_INTERVAL, LOOKBACK_MINUTES)
@@ -466,6 +466,7 @@ def open_pair_market(pair: Pair, st: PairState, z: float, beta: float, alpha: fl
     st.beta, st.alpha = beta_eff, alpha
     st.open = True
     st.entry_time = time.time()
+    st.entry_abs_z = abs(z)
 
     if TRADING_ENABLED == 0:
         print(f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
@@ -491,15 +492,13 @@ def close_pair(pair: Pair, st: PairState, reason: str) -> None:
     close_market_reduce_only(pair.a, amt_a)
     close_market_reduce_only(pair.b, amt_b)
 
-def refresh_pairs() -> List[Pair]:
-    symbols = get_universe_symbols(UNIVERSE_QUOTE, TOP_N_COINS)
-    new_pairs = select_pairs(symbols, SELECT_TOP_PAIRS)
-    return new_pairs if new_pairs else []
-
-def fmt_opt(x: Optional[float], digits: int = 2) -> str:
-    if x is None:
-        return "na"
-    return f"{x:.{digits}f}"
+def should_no_progress_exit(st: PairState, abs_z_now: float, held_min: float) -> bool:
+    if st.entry_abs_z <= 0:
+        return False
+    if held_min < NO_PROGRESS_MIN:
+        return False
+    improve = (st.entry_abs_z - abs_z_now) / st.entry_abs_z
+    return improve < MIN_IMPROVE_PCT
 
 # =========================
 # MAIN
@@ -507,7 +506,7 @@ def fmt_opt(x: Optional[float], digits: int = 2) -> str:
 def main():
     sync_time()
 
-    print("✅ Auto Pair Trading Bot (OLS Spread Z + HL + R2/Beta Filters + DRY State)")
+    print("✅ Auto Pair Trading Bot (OLS Spread Z + HL + R2/Beta Filters + Dynamic Exits + DRY State)")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
     print(f"BAR_INTERVAL={BAR_INTERVAL}, LOOKBACK_MINUTES={LOOKBACK_MINUTES}, CHECK_SEC={CHECK_SEC}")
@@ -516,6 +515,7 @@ def main():
     print(f"PAIR_REFRESH_MIN={PAIR_REFRESH_MIN} | SIGNAL_MODE={SIGNAL_MODE} | BETA_LOOKBACK={BETA_LOOKBACK} | ZSCORE_LOOKBACK={ZSCORE_LOOKBACK}")
     print(f"HL_LOOKBACK={HL_LOOKBACK} | HL_MIN_MIN={HL_MIN_MIN} | HL_MAX_MIN={HL_MAX_MIN}")
     print(f"R2_MIN={R2_MIN} | BETA_MAX={BETA_MAX}")
+    print(f"NO_PROGRESS_MIN={NO_PROGRESS_MIN} | MIN_IMPROVE_PCT={MIN_IMPROVE_PCT} | Z_STOP={Z_STOP}")
 
     pairs = refresh_pairs()
     if not pairs:
@@ -566,7 +566,7 @@ def main():
                 if st.last_close_time and (time.time() - st.last_close_time) < (COOLDOWN_MIN * 60):
                     continue
 
-                # LIVE: exchange truth
+                # ===== LIVE: exchange truth =====
                 if TRADING_ENABLED == 1:
                     amt_a, pnl_a = get_position(p.a)
                     amt_b, pnl_b = get_position(p.b)
@@ -582,30 +582,41 @@ def main():
                     if st.open:
                         held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
                         z, beta, alpha, hl, r2 = compute_signal(p)
-                        print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
+                        abs_z = abs(z)
 
+                        print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | absz={abs_z:.2f} | entryAbsZ={st.entry_abs_z:.2f} | "
+                              f"beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
+
+                        # PnL exits
                         if total_pnl >= TP_USD:
                             close_pair(p, st, reason="TP_USD"); time.sleep(2); continue
                         if total_pnl <= SL_USD:
                             close_pair(p, st, reason="SL_USD"); time.sleep(2); continue
-                        if abs(z) <= EXIT_Z:
+
+                        # Z exits
+                        if abs_z <= EXIT_Z:
                             close_pair(p, st, reason="EXIT_Z"); time.sleep(2); continue
+                        if abs_z >= Z_STOP:
+                            close_pair(p, st, reason="Z_STOP"); time.sleep(2); continue
+                        if should_no_progress_exit(st, abs_z, held_min):
+                            close_pair(p, st, reason="NO_PROGRESS"); time.sleep(2); continue
+
                         if held_min >= MAX_HOLD_MIN:
                             close_pair(p, st, reason="TIME_STOP"); time.sleep(2); continue
                         continue
 
+                    # flat -> entry
                     if open_count >= MAX_OPEN_PAIRS:
                         continue
 
                     z, beta, alpha, hl, r2 = compute_signal(p)
+                    abs_z = abs(z)
                     print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m")
 
-                    if abs(z) >= ENTRY_Z:
-                        # Half-life gate
+                    if abs_z >= ENTRY_Z:
                         if hl is None or hl < HL_MIN_MIN or hl > HL_MAX_MIN:
                             print(f"⛔ HL_FILTER {key} | hl={fmt_opt(hl,1)}m (min={HL_MIN_MIN} max={HL_MAX_MIN}) -> skip entry")
                             continue
-                        # OLS quality gates (only meaningful in SPREAD_OLS)
                         if SIGNAL_MODE == "SPREAD_OLS":
                             if r2 is None or r2 < R2_MIN:
                                 print(f"⛔ R2_FILTER {key} | r2={fmt_opt(r2,2)} (min={R2_MIN}) -> skip entry")
@@ -619,14 +630,21 @@ def main():
                         time.sleep(1)
                     continue
 
-                # DRY: simulated engine
+                # ===== DRY: simulated engine =====
                 if st.open:
                     held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
                     z, beta, alpha, hl, r2 = compute_signal(p)
-                    print(f"[DRY] PAIR {key} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
+                    abs_z = abs(z)
 
-                    if abs(z) <= EXIT_Z:
+                    print(f"[DRY] PAIR {key} | z={z:.2f} | absz={abs_z:.2f} | entryAbsZ={st.entry_abs_z:.2f} | "
+                          f"beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
+
+                    if abs_z <= EXIT_Z:
                         close_pair(p, st, reason="EXIT_Z"); time.sleep(1); continue
+                    if abs_z >= Z_STOP:
+                        close_pair(p, st, reason="Z_STOP"); time.sleep(1); continue
+                    if should_no_progress_exit(st, abs_z, held_min):
+                        close_pair(p, st, reason="NO_PROGRESS"); time.sleep(1); continue
                     if held_min >= MAX_HOLD_MIN:
                         close_pair(p, st, reason="TIME_STOP"); time.sleep(1); continue
                     continue
@@ -635,9 +653,10 @@ def main():
                     continue
 
                 z, beta, alpha, hl, r2 = compute_signal(p)
+                abs_z = abs(z)
                 print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m")
 
-                if abs(z) >= ENTRY_Z:
+                if abs_z >= ENTRY_Z:
                     if hl is None or hl < HL_MIN_MIN or hl > HL_MAX_MIN:
                         print(f"⛔ HL_FILTER {key} | hl={fmt_opt(hl,1)}m (min={HL_MIN_MIN} max={HL_MAX_MIN}) -> skip entry")
                         continue
