@@ -48,6 +48,8 @@ client = Client(API_KEY, API_SECRET)
 # Caches
 _SYMBOL_SET: Optional[set] = None
 _LOT_CACHE: Dict[str, Tuple[float, float]] = {}  # symbol -> (stepSize, minQty)
+# Kline cache: (symbol, interval, limit) -> (last_open_time_ms, closes)
+_KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, List[float]]] = {}
 
 # =========================
 # DATA
@@ -88,7 +90,6 @@ def is_valid_symbol(symbol: str) -> bool:
     try:
         return symbol in load_symbol_set()
     except Exception:
-        # if exchange_info fails temporarily, don't block the bot
         return True
 
 def get_mark(symbol: str) -> float:
@@ -96,9 +97,6 @@ def get_mark(symbol: str) -> float:
     return float(mp["markPrice"])
 
 def get_position(symbol: str) -> Tuple[float, float]:
-    """
-    returns (positionAmt, unrealizedProfit)
-    """
     data = client.futures_position_information(symbol=symbol, recvWindow=RECV_WINDOW)
     pos = data[0]
     return float(pos["positionAmt"]), float(pos["unRealizedProfit"])
@@ -133,20 +131,13 @@ def floor_to_step(symbol: str, qty: float) -> float:
     return q
 
 def ensure_symbol_settings(symbol: str) -> None:
-    """
-    Live mode: set leverage and margin type.
-    Dry-run: do nothing (avoid accidental account changes).
-    """
     if TRADING_ENABLED == 0:
         return
-
-    # leverage
     try:
         client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE, recvWindow=RECV_WINDOW)
     except Exception as e:
         print(f"⚠️ leverage set failed {symbol}: {e}")
 
-    # margin type
     try:
         client.futures_change_margin_type(symbol=symbol, marginType=MARGIN_TYPE, recvWindow=RECV_WINDOW)
     except Exception as e:
@@ -155,7 +146,6 @@ def ensure_symbol_settings(symbol: str) -> None:
             print(f"⚠️ margin type set failed {symbol}: {e}")
 
 def open_market(symbol: str, direction: int, usd: float) -> None:
-    # DRY-RUN: no orders
     if TRADING_ENABLED == 0:
         print(f"[DRY] open_market {symbol} dir={direction} usd={usd}")
         return
@@ -166,22 +156,14 @@ def open_market(symbol: str, direction: int, usd: float) -> None:
         raise RuntimeError(f"[{symbol}] qty too small for usd={usd}")
 
     side = "BUY" if direction > 0 else "SELL"
-    params = dict(
-        symbol=symbol,
-        side=side,
-        type="MARKET",
-        quantity=qty,
-        recvWindow=RECV_WINDOW,
-    )
+    params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, recvWindow=RECV_WINDOW)
 
-    # Hedge mode support
     if HEDGE_MODE == 1:
         params["positionSide"] = "LONG" if direction > 0 else "SHORT"
 
     client.futures_create_order(**params)
 
 def close_market_reduce_only(symbol: str, position_amt: float) -> None:
-    # DRY-RUN: no orders
     if TRADING_ENABLED == 0:
         print(f"[DRY] close_market {symbol} position_amt={position_amt}")
         return
@@ -223,14 +205,31 @@ def interval_to_minutes(interval: str) -> int:
 
 def fetch_closes(symbol: str, interval: str, lookback_minutes: int) -> List[float]:
     """
-    Convert lookback_minutes into number of bars for the given interval.
-    Binance limit max 1500.
+    Cached klines: if latest candle openTime hasn't changed, reuse last closes.
     """
     mins = interval_to_minutes(interval)
     bars = max(50, lookback_minutes // mins)
     limit = min(1500, bars)
+
+    cache_key = (symbol, interval, limit)
+
+    # If cached, first try to fetch a very small kline to detect candle openTime change
+    # But Binance doesn't support "limit=1" sometimes reliably for all intervals; still works for futures_klines.
+    try:
+        kl1 = client.futures_klines(symbol=symbol, interval=interval, limit=1)
+        last_open_time = int(kl1[-1][0])
+        cached = _KLINE_CACHE.get(cache_key)
+        if cached and cached[0] == last_open_time:
+            return cached[1]
+    except Exception:
+        # If lightweight check fails, fall back to full fetch below
+        pass
+
     kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-    return [float(k[4]) for k in kl]
+    last_open_time = int(kl[-1][0])
+    closes = [float(k[4]) for k in kl]
+    _KLINE_CACHE[cache_key] = (last_open_time, closes)
+    return closes
 
 def returns(series: List[float]) -> List[float]:
     out = []
@@ -266,10 +265,6 @@ def zscore(series: List[float]) -> float:
     return (series[-1] - m) / s
 
 def mean_reversion_score(ratio_series: List[float]) -> float:
-    """
-    Simple score:
-      - higher when ratio frequently crosses its mean (mean-reverting behavior)
-    """
     if len(ratio_series) < 100:
         return 0.0
     m = statistics.mean(ratio_series)
@@ -286,9 +281,6 @@ def mean_reversion_score(ratio_series: List[float]) -> float:
 # PAIR SELECTION
 # =========================
 def get_universe_symbols(quote: str, top_n: int) -> List[str]:
-    """
-    Picks top_n symbols by 24h quoteVolume from futures tickers.
-    """
     tickers = client.futures_ticker()
     candidates = []
     for t in tickers:
@@ -306,13 +298,8 @@ def get_universe_symbols(quote: str, top_n: int) -> List[str]:
     return [s for _, s in candidates[:top_n]]
 
 def select_pairs(symbols: List[str], k: int) -> List[Pair]:
-    """
-    For each pair (i,j), compute:
-      score = 0.7*abs(corr(returns)) + 0.3*mean_reversion_score(ratio)
-    Pick top k.
-    """
     scored = []
-    max_syms = min(len(symbols), 25)  # keep runtime reasonable
+    max_syms = min(len(symbols), 25)
     base = symbols[:max_syms]
 
     closes_map: Dict[str, List[float]] = {}
@@ -353,13 +340,11 @@ def compute_pair_z(pair: Pair) -> float:
     return zscore(ratio_series)
 
 def open_pair_market(pair: Pair, st: PairState, z: float) -> None:
-    # DRY-RUN: do not change exchange state / do not send orders
     if TRADING_ENABLED == 0:
         dir_a, dir_b = (-1, +1) if z >= 0 else (+1, -1)
         print(f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | dirA={dir_a} dirB={dir_b} | usd/leg={BASE_USD_PER_LEG}")
         return
 
-    # If z positive: ratio high -> short A, long B (expect ratio to fall)
     if z >= 0:
         st.dir_a, st.dir_b = -1, +1
     else:
@@ -373,7 +358,6 @@ def open_pair_market(pair: Pair, st: PairState, z: float) -> None:
     st.entry_time = time.time()
 
 def close_pair(pair: Pair) -> None:
-    # DRY-RUN: no orders
     if TRADING_ENABLED == 0:
         print(f"[DRY] EXIT {pair.a}/{pair.b}")
         return
@@ -387,7 +371,7 @@ def close_pair(pair: Pair) -> None:
 def main():
     sync_time()
 
-    print("✅ Auto Pair Trading Bot (Taker-only, Unrealized PnL TP/SL)")
+    print("✅ Auto Pair Trading Bot (Pair MR V1)")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
     print(f"BAR_INTERVAL={BAR_INTERVAL}, LOOKBACK_MINUTES={LOOKBACK_MINUTES}, CHECK_SEC={CHECK_SEC}")
@@ -404,7 +388,6 @@ def main():
     for p in pairs:
         print(f"  - {p.a}/{p.b}")
 
-    # Live-mode: set leverage/margin settings for selected symbols
     if TRADING_ENABLED == 1:
         uniq = set()
         for p in pairs:
@@ -423,19 +406,16 @@ def main():
                 key = f"{p.a}/{p.b}"
                 st = states[key]
 
-                # cooldown
                 if st.last_close_time and (time.time() - st.last_close_time) < (COOLDOWN_MIN * 60):
                     continue
 
                 amt_a, pnl_a = get_position(p.a)
                 amt_b, pnl_b = get_position(p.b)
 
-                # If dry-run and you already have positions, warn but do not touch
                 if TRADING_ENABLED == 0 and (amt_a != 0 or amt_b != 0):
                     print(f"⚠️ DRY-RUN but positions exist for {key} | amtA={amt_a} amtB={amt_b} (no action)")
                     continue
 
-                # safety: one leg open
                 if (amt_a == 0) != (amt_b == 0):
                     print(f"⚠️ ONE-LEG RISK {key} | amtA={amt_a} amtB={amt_b} -> forcing close remaining leg")
                     close_pair(p)
@@ -445,55 +425,39 @@ def main():
 
                 total_pnl = pnl_a + pnl_b
 
-                # infer open state from exchange
                 if amt_a != 0 and amt_b != 0:
                     st.open = True
                     open_count += 1
                 else:
                     st.open = False
 
-                # If open -> exit checks
                 if st.open:
                     held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
                     z = compute_pair_z(p)
-
                     print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | held={held_min:.1f}m")
 
                     if total_pnl >= TP_USD:
                         print(f"✅ TP HIT {key} -> close")
-                        close_pair(p)
-                        st.open = False
-                        st.last_close_time = time.time()
-                        time.sleep(2)
-                        continue
+                        close_pair(p); st.open = False; st.last_close_time = time.time()
+                        time.sleep(2); continue
 
                     if total_pnl <= SL_USD:
                         print(f"🛑 SL HIT {key} -> close")
-                        close_pair(p)
-                        st.open = False
-                        st.last_close_time = time.time()
-                        time.sleep(2)
-                        continue
+                        close_pair(p); st.open = False; st.last_close_time = time.time()
+                        time.sleep(2); continue
 
                     if abs(z) <= EXIT_Z:
                         print(f"✅ EXIT_Z HIT {key} -> close")
-                        close_pair(p)
-                        st.open = False
-                        st.last_close_time = time.time()
-                        time.sleep(2)
-                        continue
+                        close_pair(p); st.open = False; st.last_close_time = time.time()
+                        time.sleep(2); continue
 
                     if held_min >= MAX_HOLD_MIN:
                         print(f"⏳ TIME STOP {key} -> close")
-                        close_pair(p)
-                        st.open = False
-                        st.last_close_time = time.time()
-                        time.sleep(2)
-                        continue
+                        close_pair(p); st.open = False; st.last_close_time = time.time()
+                        time.sleep(2); continue
 
                     continue
 
-                # If flat -> entry checks (respect max open pairs)
                 if open_count >= MAX_OPEN_PAIRS:
                     continue
 
@@ -503,7 +467,6 @@ def main():
                 if abs(z) >= ENTRY_Z:
                     open_pair_market(p, st, z)
                     time.sleep(1)
-                    continue
 
             time.sleep(CHECK_SEC)
 
