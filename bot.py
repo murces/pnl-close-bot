@@ -30,7 +30,7 @@ EXIT_Z = float(os.getenv("EXIT_Z", "0.3"))
 BASE_USD_PER_LEG = float(os.getenv("BASE_USD_PER_LEG", "500"))
 TP_USD = float(os.getenv("TP_USD", "25"))
 SL_USD = float(os.getenv("SL_USD", "-80"))
-MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "120"))  # <-- set via env
+MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "120"))
 MAX_OPEN_PAIRS = int(os.getenv("MAX_OPEN_PAIRS", "3"))
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
 
@@ -90,7 +90,8 @@ class PairState:
     dir_b: int = 0
     beta: float = 1.0
     alpha: float = 0.0
-    entry_abs_z: float = 0.0  # <-- NEW: remember abs(z) at entry
+    entry_abs_z: float = 0.0
+    peak_abs_z: float = 0.0  # <-- NEW: worst abs(z) seen since entry
 
 # =========================
 # BINANCE HELPERS
@@ -466,7 +467,10 @@ def open_pair_market(pair: Pair, st: PairState, z: float, beta: float, alpha: fl
     st.beta, st.alpha = beta_eff, alpha
     st.open = True
     st.entry_time = time.time()
-    st.entry_abs_z = abs(z)
+
+    absz = abs(z)
+    st.entry_abs_z = absz
+    st.peak_abs_z = absz  # <-- init peak
 
     if TRADING_ENABLED == 0:
         print(f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
@@ -493,12 +497,13 @@ def close_pair(pair: Pair, st: PairState, reason: str) -> None:
     close_market_reduce_only(pair.b, amt_b)
 
 def should_no_progress_exit(st: PairState, abs_z_now: float, held_min: float) -> bool:
-    if st.entry_abs_z <= 0:
-        return False
     if held_min < NO_PROGRESS_MIN:
         return False
-    improve = (st.entry_abs_z - abs_z_now) / st.entry_abs_z
-    return improve < MIN_IMPROVE_PCT
+    peak = st.peak_abs_z if st.peak_abs_z > 0 else st.entry_abs_z
+    if peak <= 0:
+        return False
+    improve_from_peak = (peak - abs_z_now) / peak
+    return improve_from_peak < MIN_IMPROVE_PCT
 
 # =========================
 # MAIN
@@ -506,7 +511,7 @@ def should_no_progress_exit(st: PairState, abs_z_now: float, held_min: float) ->
 def main():
     sync_time()
 
-    print("✅ Auto Pair Trading Bot (OLS Spread Z + HL + R2/Beta Filters + Dynamic Exits + DRY State)")
+    print("✅ Auto Pair Trading Bot (OLS Spread Z + HL + R2/Beta Filters + Dynamic Exits (Peak) + DRY State)")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
     print(f"BAR_INTERVAL={BAR_INTERVAL}, LOOKBACK_MINUTES={LOOKBACK_MINUTES}, CHECK_SEC={CHECK_SEC}")
@@ -583,17 +588,17 @@ def main():
                         held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
                         z, beta, alpha, hl, r2 = compute_signal(p)
                         abs_z = abs(z)
+                        st.peak_abs_z = max(st.peak_abs_z, abs_z)  # <-- peak update
 
-                        print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | absz={abs_z:.2f} | entryAbsZ={st.entry_abs_z:.2f} | "
+                        print(f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | absz={abs_z:.2f} | "
+                              f"entryAbsZ={st.entry_abs_z:.2f} | peakAbsZ={st.peak_abs_z:.2f} | "
                               f"beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
 
-                        # PnL exits
                         if total_pnl >= TP_USD:
                             close_pair(p, st, reason="TP_USD"); time.sleep(2); continue
                         if total_pnl <= SL_USD:
                             close_pair(p, st, reason="SL_USD"); time.sleep(2); continue
 
-                        # Z exits
                         if abs_z <= EXIT_Z:
                             close_pair(p, st, reason="EXIT_Z"); time.sleep(2); continue
                         if abs_z >= Z_STOP:
@@ -605,7 +610,6 @@ def main():
                             close_pair(p, st, reason="TIME_STOP"); time.sleep(2); continue
                         continue
 
-                    # flat -> entry
                     if open_count >= MAX_OPEN_PAIRS:
                         continue
 
@@ -635,9 +639,11 @@ def main():
                     held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
                     z, beta, alpha, hl, r2 = compute_signal(p)
                     abs_z = abs(z)
+                    st.peak_abs_z = max(st.peak_abs_z, abs_z)  # <-- peak update
 
                     print(f"[DRY] PAIR {key} | z={z:.2f} | absz={abs_z:.2f} | entryAbsZ={st.entry_abs_z:.2f} | "
-                          f"beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
+                          f"peakAbsZ={st.peak_abs_z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | "
+                          f"hl={fmt_opt(hl,1)}m | held={held_min:.1f}m")
 
                     if abs_z <= EXIT_Z:
                         close_pair(p, st, reason="EXIT_Z"); time.sleep(1); continue
