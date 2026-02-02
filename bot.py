@@ -15,20 +15,19 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 if not API_KEY or not API_SECRET:
     raise SystemExit("Missing BINANCE_API_KEY / BINANCE_API_SECRET")
 
-# 0=dry-run (NO ORDERS), 1=live
-TRADING_ENABLED = int(os.getenv("TRADING_ENABLED", "0"))
+TRADING_ENABLED = int(os.getenv("TRADING_ENABLED", "0"))  # 0=dry-run, 1=live
 
-UNIVERSE_QUOTE = os.getenv("UNIVERSE_QUOTE", "USDT").upper()  # USDT or USDC
+UNIVERSE_QUOTE = os.getenv("UNIVERSE_QUOTE", "USDT").upper()
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "40"))
 SELECT_TOP_PAIRS = int(os.getenv("SELECT_TOP_PAIRS", "5"))
 
 BAR_INTERVAL = os.getenv("BAR_INTERVAL", "1m")
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "1440"))  # minutes of history
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "1440"))
 
 ENTRY_Z = float(os.getenv("ENTRY_Z", "2.0"))
 EXIT_Z = float(os.getenv("EXIT_Z", "0.3"))
 
-BASE_USD_PER_LEG = float(os.getenv("BASE_USD_PER_LEG", "500"))  # per leg notional
+BASE_USD_PER_LEG = float(os.getenv("BASE_USD_PER_LEG", "500"))
 TP_USD = float(os.getenv("TP_USD", "25"))
 SL_USD = float(os.getenv("SL_USD", "-80"))
 MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "180"))
@@ -38,18 +37,22 @@ COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
 CHECK_SEC = int(os.getenv("CHECK_SEC", "10"))
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "60000"))
 
-# Futures settings (live mode)
-HEDGE_MODE = int(os.getenv("HEDGE_MODE", "0"))  # 0=one-way, 1=hedge (dual side)
+# Futures settings (live)
+HEDGE_MODE = int(os.getenv("HEDGE_MODE", "0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()  # ISOLATED / CROSSED
+MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
+
+# Pair refresh
+PAIR_REFRESH_MIN = int(os.getenv("PAIR_REFRESH_MIN", "60"))
 
 client = Client(API_KEY, API_SECRET)
 
-# Caches
+# =========================
+# CACHES
+# =========================
 _SYMBOL_SET: Optional[set] = None
 _LOT_CACHE: Dict[str, Tuple[float, float]] = {}  # symbol -> (stepSize, minQty)
-# Kline cache: (symbol, interval, limit) -> (last_open_time_ms, closes)
-_KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, List[float]]] = {}
+_KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, List[float]]] = {}  # (sym, interval, limit) -> (last_open_ms, closes)
 
 # =========================
 # DATA
@@ -64,7 +67,7 @@ class PairState:
     open: bool = False
     entry_time: float = 0.0
     last_close_time: float = 0.0
-    dir_a: int = 0   # +1 long, -1 short
+    dir_a: int = 0
     dir_b: int = 0
 
 # =========================
@@ -137,7 +140,6 @@ def ensure_symbol_settings(symbol: str) -> None:
         client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE, recvWindow=RECV_WINDOW)
     except Exception as e:
         print(f"⚠️ leverage set failed {symbol}: {e}")
-
     try:
         client.futures_change_margin_type(symbol=symbol, marginType=MARGIN_TYPE, recvWindow=RECV_WINDOW)
     except Exception as e:
@@ -157,10 +159,8 @@ def open_market(symbol: str, direction: int, usd: float) -> None:
 
     side = "BUY" if direction > 0 else "SELL"
     params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, recvWindow=RECV_WINDOW)
-
     if HEDGE_MODE == 1:
         params["positionSide"] = "LONG" if direction > 0 else "SHORT"
-
     client.futures_create_order(**params)
 
 def close_market_reduce_only(symbol: str, position_amt: float) -> None:
@@ -170,24 +170,14 @@ def close_market_reduce_only(symbol: str, position_amt: float) -> None:
 
     if position_amt == 0:
         return
-
     side = "SELL" if position_amt > 0 else "BUY"
     qty = floor_to_step(symbol, abs(position_amt))
     if qty <= 0:
         return
 
-    params = dict(
-        symbol=symbol,
-        side=side,
-        type="MARKET",
-        quantity=qty,
-        reduceOnly=True,
-        recvWindow=RECV_WINDOW,
-    )
-
+    params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, reduceOnly=True, recvWindow=RECV_WINDOW)
     if HEDGE_MODE == 1:
         params["positionSide"] = "LONG" if position_amt > 0 else "SHORT"
-
     client.futures_create_order(**params)
 
 # =========================
@@ -204,17 +194,11 @@ def interval_to_minutes(interval: str) -> int:
     raise ValueError(f"Unsupported interval: {interval}")
 
 def fetch_closes(symbol: str, interval: str, lookback_minutes: int) -> List[float]:
-    """
-    Cached klines: if latest candle openTime hasn't changed, reuse last closes.
-    """
     mins = interval_to_minutes(interval)
     bars = max(50, lookback_minutes // mins)
     limit = min(1500, bars)
-
     cache_key = (symbol, interval, limit)
 
-    # If cached, first try to fetch a very small kline to detect candle openTime change
-    # But Binance doesn't support "limit=1" sometimes reliably for all intervals; still works for futures_klines.
     try:
         kl1 = client.futures_klines(symbol=symbol, interval=interval, limit=1)
         last_open_time = int(kl1[-1][0])
@@ -222,7 +206,6 @@ def fetch_closes(symbol: str, interval: str, lookback_minutes: int) -> List[floa
         if cached and cached[0] == last_open_time:
             return cached[1]
     except Exception:
-        # If lightweight check fails, fall back to full fetch below
         pass
 
     kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
@@ -368,19 +351,25 @@ def close_pair(pair: Pair) -> None:
     close_market_reduce_only(pair.a, amt_a)
     close_market_reduce_only(pair.b, amt_b)
 
+def refresh_pairs() -> List[Pair]:
+    symbols = get_universe_symbols(UNIVERSE_QUOTE, TOP_N_COINS)
+    new_pairs = select_pairs(symbols, SELECT_TOP_PAIRS)
+    if not new_pairs:
+        return []
+    return new_pairs
+
 def main():
     sync_time()
 
-    print("✅ Auto Pair Trading Bot (Pair MR V1)")
+    print("✅ Auto Pair Trading Bot (Pair MR V1 + Refresh)")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
     print(f"BAR_INTERVAL={BAR_INTERVAL}, LOOKBACK_MINUTES={LOOKBACK_MINUTES}, CHECK_SEC={CHECK_SEC}")
     print(f"ENTRY_Z={ENTRY_Z}, EXIT_Z={EXIT_Z}, TP_USD={TP_USD}, SL_USD={SL_USD}, MAX_HOLD_MIN={MAX_HOLD_MIN}")
     print(f"BASE_USD_PER_LEG={BASE_USD_PER_LEG}, MAX_OPEN_PAIRS={MAX_OPEN_PAIRS}, COOLDOWN_MIN={COOLDOWN_MIN}")
+    print(f"PAIR_REFRESH_MIN={PAIR_REFRESH_MIN}")
 
-    symbols = get_universe_symbols(UNIVERSE_QUOTE, TOP_N_COINS)
-    pairs = select_pairs(symbols, SELECT_TOP_PAIRS)
-
+    pairs = refresh_pairs()
     if not pairs:
         raise SystemExit("No pairs selected. Try increasing TOP_N_COINS or LOOKBACK_MINUTES.")
 
@@ -397,14 +386,51 @@ def main():
             ensure_symbol_settings(sym)
 
     states: Dict[str, PairState] = {f"{p.a}/{p.b}": PairState() for p in pairs}
+    last_refresh_ts = time.time()
 
     while True:
         try:
             open_count = 0
 
+            # Count open pairs (exchange truth)
+            # Also used to block refresh while positions exist.
+            any_positions = False
+            for p in pairs:
+                amt_a, _ = get_position(p.a)
+                amt_b, _ = get_position(p.b)
+                if amt_a != 0 or amt_b != 0:
+                    any_positions = True
+                    break
+
+            # Refresh pairs only when flat
+            if (time.time() - last_refresh_ts) >= (PAIR_REFRESH_MIN * 60) and not any_positions:
+                print("🔄 REFRESH: selecting new pairs...")
+                new_pairs = refresh_pairs()
+                if new_pairs:
+                    pairs = new_pairs
+                    states = {f"{p.a}/{p.b}": PairState() for p in pairs}
+                    # Optional: clear cache to avoid stale series after refresh
+                    # _KLINE_CACHE.clear()
+                    print("✅ REFRESH done. New pairs:")
+                    for p in pairs:
+                        print(f"  - {p.a}/{p.b}")
+                    if TRADING_ENABLED == 1:
+                        uniq = set()
+                        for p in pairs:
+                            uniq.add(p.a)
+                            uniq.add(p.b)
+                        for sym in sorted(uniq):
+                            ensure_symbol_settings(sym)
+                else:
+                    print("⚠️ REFRESH failed (no pairs). Keeping current list.")
+                last_refresh_ts = time.time()
+
             for p in pairs:
                 key = f"{p.a}/{p.b}"
-                st = states[key]
+                st = states.get(key)
+                if st is None:
+                    st = PairState()
+                    states[key] = st
 
                 if st.last_close_time and (time.time() - st.last_close_time) < (COOLDOWN_MIN * 60):
                     continue
