@@ -1,101 +1,129 @@
 import os
 import time
 import math
+import json
 import statistics
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from binance.client import Client
 
-# =========================
-# ENV
-# =========================
+# =========================================================
+# ENV / BINANCE
+# =========================================================
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 if not API_KEY or not API_SECRET:
     raise SystemExit("Missing BINANCE_API_KEY / BINANCE_API_SECRET")
 
 TRADING_ENABLED = int(os.getenv("TRADING_ENABLED", "0"))  # 0=dry-run, 1=live
-
-UNIVERSE_QUOTE = os.getenv("UNIVERSE_QUOTE", "USDT").upper()
-TOP_N_COINS = int(os.getenv("TOP_N_COINS", "40"))
-SELECT_TOP_PAIRS = int(os.getenv("SELECT_TOP_PAIRS", "5"))
-
-BAR_INTERVAL = os.getenv("BAR_INTERVAL", "1m")
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "1440"))
-
-ENTRY_Z = float(os.getenv("ENTRY_Z", "2.0"))
-EXIT_Z = float(os.getenv("EXIT_Z", "0.3"))
-
-BASE_USD_PER_LEG = float(os.getenv("BASE_USD_PER_LEG", "500"))
-TP_USD = float(os.getenv("TP_USD", "25"))
-SL_USD = float(os.getenv("SL_USD", "-80"))
-MAX_HOLD_MIN = int(os.getenv("MAX_HOLD_MIN", "120"))
-MAX_OPEN_PAIRS = int(os.getenv("MAX_OPEN_PAIRS", "3"))
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
-
-CHECK_SEC = int(os.getenv("CHECK_SEC", "10"))
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "60000"))
+CHECK_SEC = int(os.getenv("CHECK_SEC", "5"))
 
-# Futures settings (live)
-HEDGE_MODE = int(os.getenv("HEDGE_MODE", "0"))
+# Futures settings
+HEDGE_MODE = int(os.getenv("HEDGE_MODE", "0"))  # 0=one-way, 1=hedge
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 
-# Pair refresh
-PAIR_REFRESH_MIN = int(os.getenv("PAIR_REFRESH_MIN", "60"))
+# =========================================================
+# STRATEGY: DCA SCALP (ONLY) + AUTO SYMBOL + AUTO SIDE
+# Coin selection == entry opportunity scan
+# =========================================================
+UNIVERSE_QUOTE = os.getenv("UNIVERSE_QUOTE", "USDT").upper()
+TOP_N_COINS = int(os.getenv("TOP_N_COINS", "60"))  # volume-ranked candidates
+COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
+RESELECT_MIN = int(os.getenv("RESELECT_MIN", "10"))  # how often re-scan when flat
 
-# Signal
-SIGNAL_MODE = os.getenv("SIGNAL_MODE", "RATIO_Z").upper()  # RATIO_Z or SPREAD_OLS
-BETA_LOOKBACK = int(os.getenv("BETA_LOOKBACK", "720"))
-ZSCORE_LOOKBACK = int(os.getenv("ZSCORE_LOOKBACK", "720"))
+# Timeframes
+TREND_INTERVAL = os.getenv("TREND_INTERVAL", "15m")  # long-trend TF
+ENTRY_INTERVAL = os.getenv("ENTRY_INTERVAL", "1m")   # entry TF
 
-# Half-life filter (minutes)
-HL_LOOKBACK = int(os.getenv("HL_LOOKBACK", "720"))
-HL_MIN_MIN = int(os.getenv("HL_MIN_MIN", "5"))
-HL_MAX_MIN = int(os.getenv("HL_MAX_MIN", "180"))
+# Trend/Pullback/Reversal params
+TREND_EMA = int(os.getenv("TREND_EMA", "200"))
+FAST_EMA = int(os.getenv("FAST_EMA", "20"))
+SLOW_EMA = int(os.getenv("SLOW_EMA", "50"))
 
-# OLS quality filters
-R2_MIN = float(os.getenv("R2_MIN", "0.60"))
-BETA_MAX = float(os.getenv("BETA_MAX", "2.50"))
+PULLBACK_LOOKBACK_BARS = int(os.getenv("PULLBACK_LOOKBACK_BARS", "60"))  # entry TF bars
+PULLBACK_MIN_PCT = float(os.getenv("PULLBACK_MIN_PCT", "0.35")) / 100.0
+PULLBACK_MAX_PCT = float(os.getenv("PULLBACK_MAX_PCT", "1.50")) / 100.0
 
-# Dynamic exits (z behavior)
-NO_PROGRESS_MIN = int(os.getenv("NO_PROGRESS_MIN", "20"))
-MIN_IMPROVE_PCT = float(os.getenv("MIN_IMPROVE_PCT", "0.20"))  # 20%
-Z_STOP = float(os.getenv("Z_STOP", "3.5"))
+# Reversal confirmation: require a fresh cross in last N bars and then hold
+CROSS_LOOKBACK_BARS = int(os.getenv("CROSS_LOOKBACK_BARS", "8"))        # search recent cross
+REVERSE_CONFIRM_BARS = int(os.getenv("REVERSE_CONFIRM_BARS", "2"))       # after cross, remain in favor
+
+# Volatility filter (avoid too sleepy / too wild)
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "720"))     # for fetching data
+VOL_LOOKBACK_BARS = int(os.getenv("VOL_LOOKBACK_BARS", "240"))   # entry TF
+VOL_MIN = float(os.getenv("VOL_MIN", "0.0006"))                 # 0.06% stdev
+VOL_MAX = float(os.getenv("VOL_MAX", "0.0040"))                 # 0.40% stdev
+
+# DCA params (USDT notional per add)
+DCA_BASE_USD = float(os.getenv("DCA_BASE_USD", "50"))
+DCA_STEP_PCT = float(os.getenv("DCA_STEP_PCT", "0.40")) / 100.0
+DCA_MULT = float(os.getenv("DCA_MULT", "1.5"))
+DCA_MAX_LEVELS = int(os.getenv("DCA_MAX_LEVELS", "5"))
+
+# PnL-based exits (live recommended)
+USE_PNL_EXIT = int(os.getenv("USE_PNL_EXIT", "1"))  # 1=use unrealized PnL (live)
+TP_PNL_USD = float(os.getenv("TP_PNL_USD", "8"))
+SL_PNL_USD = float(os.getenv("SL_PNL_USD", "-25"))
+
+# Optional safety exits (works also in DRY)
+USE_PRICE_EXIT = int(os.getenv("USE_PRICE_EXIT", "1"))
+TP_PCT = float(os.getenv("TP_PCT", "0.45")) / 100.0
+HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "2.00")) / 100.0
+TIME_STOP_MIN = int(os.getenv("TIME_STOP_MIN", "45"))
+
+# Exposure guard (A)
+MAX_TOTAL_USD_EXPOSURE = float(os.getenv("MAX_TOTAL_USD_EXPOSURE", "600"))
+EXPOSURE_ACTION = os.getenv("EXPOSURE_ACTION", "STOP_ADD").upper()  # STOP_ADD or FORCE_CLOSE
+
+# Symbol filters
+EXCLUDE_KEYWORDS = os.getenv(
+    "EXCLUDE_KEYWORDS",
+    "BUSD,USDC,TUSD,FDUSD,DAI,PAX,EUR,GBP,TRY"
+).upper().split(",")
+
+ALLOWLIST = [s.strip().upper() for s in os.getenv("SYMBOL_ALLOWLIST", "").split(",") if s.strip()]
+DENYLIST = [s.strip().upper() for s in os.getenv("SYMBOL_DENYLIST", "").split(",") if s.strip()]
+
+# State persistence
+STATE_PATH = os.getenv("STATE_PATH", "dca_state.json")
+RECOVER_OPEN_POS = int(os.getenv("RECOVER_OPEN_POS", "1"))  # if bot restarts with open pos, try to recover
 
 client = Client(API_KEY, API_SECRET)
 
-# =========================
+# =========================================================
 # CACHES
-# =========================
+# =========================================================
 _SYMBOL_SET: Optional[set] = None
 _LOT_CACHE: Dict[str, Tuple[float, float]] = {}
 _KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, List[float]]] = {}
 
-# =========================
+# =========================================================
 # DATA
-# =========================
+# =========================================================
 @dataclass
-class Pair:
-    a: str
-    b: str
-
-@dataclass
-class PairState:
+class DCAState:
+    symbol: str = ""
+    side: int = 0  # +1 long, -1 short
     open: bool = False
+
     entry_time: float = 0.0
     last_close_time: float = 0.0
-    dir_a: int = 0
-    dir_b: int = 0
-    beta: float = 1.0
-    alpha: float = 0.0
-    entry_abs_z: float = 0.0
-    peak_abs_z: float = 0.0  # worst abs(z) seen since entry
+    last_scan_ts: float = 0.0
 
-# =========================
+    level: int = 0
+    next_add_price: float = 0.0
+
+    # approx accounting for decisions
+    avg_entry_est: float = 0.0
+    pos_qty_est: float = 0.0
+    total_usd_est: float = 0.0
+
+# =========================================================
 # BINANCE HELPERS
-# =========================
+# =========================================================
 def sync_time() -> None:
     try:
         server_time = client.futures_time()["serverTime"]
@@ -126,6 +154,19 @@ def get_position(symbol: str) -> Tuple[float, float]:
     data = client.futures_position_information(symbol=symbol, recvWindow=RECV_WINDOW)
     pos = data[0]
     return float(pos["positionAmt"]), float(pos["unRealizedProfit"])
+
+def get_any_open_position_symbol() -> Optional[str]:
+    # Best-effort: find any non-zero position on futures account
+    try:
+        positions = client.futures_position_information(recvWindow=RECV_WINDOW)
+        for p in positions:
+            amt = float(p.get("positionAmt", "0") or 0.0)
+            sym = p.get("symbol", "")
+            if amt != 0.0 and sym and sym.endswith(UNIVERSE_QUOTE):
+                return sym
+    except Exception:
+        return None
+    return None
 
 def get_step_min(symbol: str) -> Tuple[float, float]:
     if symbol not in _LOT_CACHE:
@@ -197,9 +238,9 @@ def close_market_reduce_only(symbol: str, position_amt: float) -> None:
         params["positionSide"] = "LONG" if position_amt > 0 else "SHORT"
     client.futures_create_order(**params)
 
-# =========================
+# =========================================================
 # DATA / STATS
-# =========================
+# =========================================================
 def interval_to_minutes(interval: str) -> int:
     interval = interval.strip().lower()
     if interval.endswith("m"):
@@ -212,7 +253,7 @@ def interval_to_minutes(interval: str) -> int:
 
 def fetch_closes(symbol: str, interval: str, lookback_minutes: int) -> List[float]:
     mins = interval_to_minutes(interval)
-    bars = max(50, lookback_minutes // mins)
+    bars = max(120, lookback_minutes // mins)
     limit = min(1500, bars)
     cache_key = (symbol, interval, limit)
 
@@ -231,121 +272,14 @@ def fetch_closes(symbol: str, interval: str, lookback_minutes: int) -> List[floa
     _KLINE_CACHE[cache_key] = (last_open_time, closes)
     return closes
 
-def zscore_last(series: List[float], lookback: int) -> float:
-    if len(series) < max(50, lookback):
-        return 0.0
-    w = series[-lookback:]
-    m = statistics.mean(w)
-    s = statistics.pstdev(w)
-    if s == 0:
-        return 0.0
-    return (w[-1] - m) / s
-
-def log_prices(closes: List[float]) -> List[float]:
-    return [math.log(c) if c > 0 else 0.0 for c in closes]
-
-def ols_beta_alpha_r2(x: List[float], y: List[float]) -> Tuple[float, float, Optional[float]]:
-    n = min(len(x), len(y))
-    if n < 50:
-        return 1.0, 0.0, None
-
-    x = x[-n:]
-    y = y[-n:]
-    mx = statistics.mean(x)
-    my = statistics.mean(y)
-
-    vy = sum((yi - my) ** 2 for yi in y) / n
-    if vy == 0:
-        return 1.0, mx - my, None
-
-    cov = sum((x[i] - mx) * (y[i] - my) for i in range(n)) / n
-    beta = cov / vy
-    if not math.isfinite(beta):
-        beta = 1.0
-    beta = max(0.0, min(beta, 5.0))
-    alpha = mx - beta * my
-
-    sst = sum((xi - mx) ** 2 for xi in x)
-    if sst <= 0:
-        return beta, alpha, None
-    sse = 0.0
-    for i in range(n):
-        pred = alpha + beta * y[i]
-        err = x[i] - pred
-        sse += err * err
-    r2 = 1.0 - (sse / sst)
-    if not math.isfinite(r2):
-        r2 = None
-    else:
-        r2 = max(0.0, min(1.0, r2))
-    return beta, alpha, r2
-
-def spread_series_from_prices(a_closes: List[float], b_closes: List[float], beta: float, alpha: float) -> List[float]:
-    xa = log_prices(a_closes)
-    yb = log_prices(b_closes)
-    n = min(len(xa), len(yb))
-    xa = xa[-n:]
-    yb = yb[-n:]
-    return [xa[i] - (alpha + beta * yb[i]) for i in range(n)]
-
-def half_life_minutes(spread: List[float], interval: str, lookback: int) -> Optional[float]:
-    if len(spread) < max(60, lookback):
-        return None
-
-    mins_per_bar = interval_to_minutes(interval)
-    w = spread[-lookback:]
-    s_lag = w[:-1]
-    ds = [w[i] - w[i - 1] for i in range(1, len(w))]
-
-    n = len(ds)
-    if n < 50:
-        return None
-
-    mx = statistics.mean(s_lag)
-    my = statistics.mean(ds)
-
-    vx = sum((x - mx) ** 2 for x in s_lag) / n
-    if vx == 0:
-        return None
-    cov = sum((s_lag[i] - mx) * (ds[i] - my) for i in range(n)) / n
-    b = cov / vx
-
-    if not math.isfinite(b) or b >= 0:
-        return None
-    one_plus_b = 1.0 + b
-    if one_plus_b <= 0 or one_plus_b >= 1:
-        return None
-
-    hl_bars = -math.log(2.0) / math.log(one_plus_b)
-    if not math.isfinite(hl_bars) or hl_bars <= 0:
-        return None
-
-    return hl_bars * mins_per_bar
-
-def fmt_opt(x: Optional[float], digits: int = 2) -> str:
-    if x is None:
-        return "na"
-    return f"{x:.{digits}f}"
-
-# =========================
-# PAIR SELECTION
-# =========================
-def get_universe_symbols(quote: str, top_n: int) -> List[str]:
-    tickers = client.futures_ticker()
-    candidates = []
-    for t in tickers:
-        sym = t.get("symbol", "")
-        if not sym.endswith(quote):
-            continue
-        if not is_valid_symbol(sym):
-            continue
-        try:
-            qv = float(t.get("quoteVolume", 0.0))
-        except Exception:
-            qv = 0.0
-        candidates.append((qv, sym))
-    candidates.sort(reverse=True, key=lambda x: x[0])
-    return [s for _, s in candidates[:top_n]]
+def ema(series: List[float], period: int) -> float:
+    if len(series) < period + 5:
+        return series[-1] if series else 0.0
+    k = 2.0 / (period + 1.0)
+    e = series[0]
+    for v in series[1:]:
+        e = v * k + e * (1 - k)
+    return e
 
 def returns(series: List[float]) -> List[float]:
     out = []
@@ -356,384 +290,528 @@ def returns(series: List[float]) -> List[float]:
             out.append((series[i] / series[i - 1]) - 1.0)
     return out
 
-def corr(x: List[float], y: List[float]) -> float:
-    n = min(len(x), len(y))
-    if n < 30:
+def stdev_returns(closes: List[float], lookback: int) -> float:
+    if len(closes) < lookback + 5:
         return 0.0
-    x = x[-n:]
-    y = y[-n:]
-    mx = statistics.mean(x)
-    my = statistics.mean(y)
-    sx = statistics.pstdev(x)
-    sy = statistics.pstdev(y)
-    if sx == 0 or sy == 0:
+    r = returns(closes[-(lookback + 1):])
+    if len(r) < 30:
         return 0.0
-    cov = sum((x[i] - mx) * (y[i] - my) for i in range(n)) / n
-    return cov / (sx * sy)
-
-def mean_reversion_score(ratio_series: List[float]) -> float:
-    if len(ratio_series) < 100:
+    s = statistics.pstdev(r)
+    if not math.isfinite(s):
         return 0.0
-    m = statistics.mean(ratio_series)
-    crossings = 0
-    prev = ratio_series[0] - m
-    for v in ratio_series[1:]:
-        cur = v - m
-        if (prev <= 0 < cur) or (prev >= 0 > cur):
-            crossings += 1
-        prev = cur
-    return crossings / len(ratio_series)
+    return s
 
-def select_pairs(symbols: List[str], k: int) -> List["Pair"]:
-    scored = []
-    max_syms = min(len(symbols), 25)
-    base = symbols[:max_syms]
+# =========================================================
+# STATE
+# =========================================================
+def save_state(st: DCAState) -> None:
+    try:
+        data = {
+            "symbol": st.symbol,
+            "side": st.side,
+            "open": st.open,
+            "entry_time": st.entry_time,
+            "last_close_time": st.last_close_time,
+            "last_scan_ts": st.last_scan_ts,
+            "level": st.level,
+            "next_add_price": st.next_add_price,
+            "avg_entry_est": st.avg_entry_est,
+            "pos_qty_est": st.pos_qty_est,
+            "total_usd_est": st.total_usd_est,
+        }
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"⚠️ state save failed: {e}")
 
-    closes_map: Dict[str, List[float]] = {}
-    for s in base:
+def load_state() -> DCAState:
+    try:
+        if not os.path.exists(STATE_PATH):
+            return DCAState()
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        st = DCAState()
+        st.symbol = str(data.get("symbol", "")).upper()
+        st.side = int(data.get("side", 0))
+        st.open = bool(data.get("open", False))
+        st.entry_time = float(data.get("entry_time", 0.0))
+        st.last_close_time = float(data.get("last_close_time", 0.0))
+        st.last_scan_ts = float(data.get("last_scan_ts", 0.0))
+        st.level = int(data.get("level", 0))
+        st.next_add_price = float(data.get("next_add_price", 0.0))
+        st.avg_entry_est = float(data.get("avg_entry_est", 0.0))
+        st.pos_qty_est = float(data.get("pos_qty_est", 0.0))
+        st.total_usd_est = float(data.get("total_usd_est", 0.0))
+        return st
+    except Exception as e:
+        print(f"⚠️ state load failed: {e}")
+        return DCAState()
+
+def reset_position_state(st: DCAState) -> None:
+    st.open = False
+    st.entry_time = 0.0
+    st.level = 0
+    st.next_add_price = 0.0
+    st.avg_entry_est = 0.0
+    st.pos_qty_est = 0.0
+    st.total_usd_est = 0.0
+
+# =========================================================
+# DCA PRICING (decision helpers)
+# =========================================================
+def dca_next_add_price(avg_entry: float, side: int, step_pct: float, level: int) -> float:
+    if avg_entry <= 0:
+        return 0.0
+    if side > 0:
+        return avg_entry * (1.0 - step_pct * level)
+    else:
+        return avg_entry * (1.0 + step_pct * level)
+
+def price_tp(avg_entry: float, side: int, tp_pct: float) -> float:
+    if avg_entry <= 0:
+        return 0.0
+    return avg_entry * (1.0 + tp_pct) if side > 0 else avg_entry * (1.0 - tp_pct)
+
+def price_stop(avg_entry: float, side: int, stop_pct: float) -> float:
+    if avg_entry <= 0:
+        return 0.0
+    return avg_entry * (1.0 - stop_pct) if side > 0 else avg_entry * (1.0 + stop_pct)
+
+# =========================================================
+# SYMBOL FILTERS / CANDIDATES
+# =========================================================
+def excluded_symbol(sym: str) -> bool:
+    s = sym.upper()
+    if not s.endswith(UNIVERSE_QUOTE):
+        return True
+    if ALLOWLIST and s not in set(ALLOWLIST):
+        return True
+    if s in set(DENYLIST):
+        return True
+    # avoid stable-ish bases or non-crypto synthetics by keyword
+    for kw in EXCLUDE_KEYWORDS:
+        kw = kw.strip()
+        if not kw:
+            continue
+        if s.startswith(kw):
+            return True
+    return False
+
+def get_top_symbols_by_volume(quote: str, top_n: int) -> List[str]:
+    tickers = client.futures_ticker()
+    cand = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith(quote):
+            continue
+        if excluded_symbol(sym):
+            continue
+        if not is_valid_symbol(sym):
+            continue
         try:
-            closes_map[s] = fetch_closes(s, BAR_INTERVAL, LOOKBACK_MINUTES)
+            qv = float(t.get("quoteVolume", 0.0))
+        except Exception:
+            qv = 0.0
+        cand.append((qv, sym))
+    cand.sort(reverse=True, key=lambda x: x[0])
+    return [s for _, s in cand[:top_n]]
+
+# =========================================================
+# TREND + PULLBACK + REVERSAL (entry opportunity)
+# =========================================================
+def trend_direction(symbol: str) -> Optional[int]:
+    """
+    +1 uptrend (price > EMA(TREND_EMA) on TREND_INTERVAL)
+    -1 downtrend (price < EMA(TREND_EMA))
+    None unclear
+    """
+    closes = fetch_closes(symbol, TREND_INTERVAL, LOOKBACK_MINUTES)
+    if len(closes) < max(TREND_EMA + 20, 250):
+        return None
+    w = closes[-max(TREND_EMA * 3, 450):]
+    et = ema(w, TREND_EMA)
+    px = w[-1]
+    if et <= 0:
+        return None
+    if px > et:
+        return +1
+    if px < et:
+        return -1
+    return None
+
+def _last_cross_direction(closes: List[float], lookback: int) -> Optional[int]:
+    """
+    Return +1 if fast crossed above slow within lookback bars (and now above),
+    -1 if fast crossed below slow within lookback bars (and now below),
+    None otherwise.
+    """
+    if len(closes) < max(SLOW_EMA + lookback + 5, 200):
+        return None
+
+    # compute fast/slow EMA series over a window (approx, but effective)
+    # We'll build ema stepwise for last window
+    window = closes[-max(SLOW_EMA * 6, 400):]
+
+    def ema_series(vals: List[float], period: int) -> List[float]:
+        if len(vals) < period + 5:
+            return []
+        k = 2.0 / (period + 1.0)
+        e = vals[0]
+        out = [e]
+        for v in vals[1:]:
+            e = v * k + e * (1 - k)
+            out.append(e)
+        return out
+
+    ef = ema_series(window, FAST_EMA)
+    es = ema_series(window, SLOW_EMA)
+    if not ef or not es:
+        return None
+
+    n = min(len(ef), len(es))
+    ef = ef[-n:]
+    es = es[-n:]
+
+    diff = [ef[i] - es[i] for i in range(n)]
+    now = diff[-1]
+    if now == 0:
+        return None
+
+    # Look for a sign change within last `lookback` bars
+    lb = min(lookback, n - 2)
+    crossed = None
+    for i in range(n - lb - 1, n - 1):
+        if diff[i] == 0:
+            continue
+        if (diff[i] < 0 and diff[i + 1] > 0):
+            crossed = +1
+        elif (diff[i] > 0 and diff[i + 1] < 0):
+            crossed = -1
+
+    if crossed is None:
+        return None
+
+    # confirm: last REVERSE_CONFIRM_BARS remain in crossed direction
+    k = min(REVERSE_CONFIRM_BARS, n - 1)
+    tail = diff[-k:]
+    if crossed == +1 and all(x > 0 for x in tail):
+        return +1
+    if crossed == -1 and all(x < 0 for x in tail):
+        return -1
+    return None
+
+def pullback_pct(closes: List[float], trend: int) -> float:
+    """
+    Pullback magnitude within last PULLBACK_LOOKBACK_BARS:
+    uptrend: (recent_high - current) / recent_high
+    downtrend: (current - recent_low) / current
+    """
+    if len(closes) < PULLBACK_LOOKBACK_BARS + 5:
+        return 0.0
+    recent = closes[-PULLBACK_LOOKBACK_BARS:]
+    px = recent[-1]
+    hi = max(recent)
+    lo = min(recent)
+    if trend > 0:
+        return (hi - px) / hi if hi > 0 else 0.0
+    else:
+        return (px - lo) / px if px > 0 else 0.0
+
+def scan_for_entry_candidate() -> Optional[Tuple[str, int, float, float, float]]:
+    """
+    Returns: (symbol, side, score, pullback, vol)
+    side = +1 LONG, -1 SHORT
+    Only returns candidates that satisfy:
+      - long TF trend
+      - short TF pullback within [min,max]
+      - recent reversal cross in trend direction
+      - volatility within [VOL_MIN,VOL_MAX] (soft filter; can fallback)
+    """
+    tops = get_top_symbols_by_volume(UNIVERSE_QUOTE, TOP_N_COINS)
+
+    best = None  # (score, sym, side, pb, vol, rank_bonus)
+    for idx, sym in enumerate(tops):
+        try:
+            tr = trend_direction(sym)
+            if tr is None:
+                continue
+
+            entry_closes = fetch_closes(sym, ENTRY_INTERVAL, LOOKBACK_MINUTES)
+            if len(entry_closes) < max(SLOW_EMA + 120, 250):
+                continue
+
+            pb = pullback_pct(entry_closes, tr)
+            if pb < PULLBACK_MIN_PCT or pb > PULLBACK_MAX_PCT:
+                continue
+
+            # reversal cross in trend direction must exist recently
+            cross_dir = _last_cross_direction(entry_closes, lookback=CROSS_LOOKBACK_BARS)
+            if cross_dir is None or cross_dir != tr:
+                continue
+
+            vol = stdev_returns(entry_closes, VOL_LOOKBACK_BARS)
+            vol_ok = (vol >= VOL_MIN and vol <= VOL_MAX) if vol > 0 else False
+            if not vol_ok:
+                # skip extreme cases; keep a soft path only if data missing
+                continue
+
+            # score: prefer top volume ranks + "ideal" pullback mid + vol mid
+            rank_bonus = (len(tops) - idx) / max(1, len(tops))
+
+            pb_mid = (PULLBACK_MIN_PCT + PULLBACK_MAX_PCT) / 2.0
+            pb_closeness = 1.0 - min(1.0, abs(pb - pb_mid) / (pb_mid if pb_mid > 0 else 1.0))
+
+            vol_mid = (VOL_MIN + VOL_MAX) / 2.0
+            vol_closeness = 1.0 - min(1.0, abs(vol - vol_mid) / (vol_mid if vol_mid > 0 else 1.0))
+
+            score = 0.55 * rank_bonus + 0.25 * pb_closeness + 0.20 * vol_closeness
+
+            if best is None or score > best[0]:
+                best = (score, sym, tr, pb, vol, rank_bonus)
+
         except Exception:
             continue
 
-    keys = list(closes_map.keys())
-    for i in range(len(keys)):
-        for j in range(i + 1, len(keys)):
-            a, b = keys[i], keys[j]
-            ca, cb = closes_map[a], closes_map[b]
-            n = min(len(ca), len(cb))
-            if n < 200:
-                continue
-            ca, cb = ca[-n:], cb[-n:]
-            ra, rb = returns(ca), returns(cb)
-            c = abs(corr(ra, rb))
-            ratio_series = [ca[x] / cb[x] if cb[x] != 0 else 0.0 for x in range(n)]
-            mr = mean_reversion_score(ratio_series)
-            score = 0.7 * c + 0.3 * mr
-            scored.append((score, a, b))
+    if best is None:
+        return None
+    return best[1], best[2], best[0], best[3], best[4]
 
-    scored.sort(reverse=True, key=lambda x: x[0])
-
-    # ---- NEW: overlap-reduced greedy selection ----
-    selected: List[Pair] = []
-    used = set()
-
-    # 1) prefer pairs without coin overlap
-    for _, a, b in scored:
-        if a in used or b in used:
-            continue
-        selected.append(Pair(a=a, b=b))
-        used.add(a); used.add(b)
-        if len(selected) >= k:
-            break
-
-    # 2) if not enough pairs, allow overlap to fill
-    if len(selected) < k:
-        for _, a, b in scored:
-            if any((x.a == a and x.b == b) for x in selected):
-                continue
-            selected.append(Pair(a=a, b=b))
-            if len(selected) >= k:
-                break
-
-    return selected
-
-def refresh_pairs() -> List["Pair"]:
-    symbols = get_universe_symbols(UNIVERSE_QUOTE, TOP_N_COINS)
-    new_pairs = select_pairs(symbols, SELECT_TOP_PAIRS)
-    return new_pairs if new_pairs else []
-
-# =========================
-# SIGNAL
-# =========================
-def compute_signal(pair: Pair) -> Tuple[float, float, float, Optional[float], Optional[float]]:
-    """
-    Returns (z, beta, alpha, hl_minutes, r2)
-    """
-    ca = fetch_closes(pair.a, BAR_INTERVAL, LOOKBACK_MINUTES)
-    cb = fetch_closes(pair.b, BAR_INTERVAL, LOOKBACK_MINUTES)
-    n = min(len(ca), len(cb))
-    ca, cb = ca[-n:], cb[-n:]
-
-    if SIGNAL_MODE == "SPREAD_OLS":
-        beta_lb = min(BETA_LOOKBACK, n)
-        z_lb = min(ZSCORE_LOOKBACK, n)
-        hl_lb = min(HL_LOOKBACK, n)
-
-        xa = log_prices(ca[-beta_lb:])
-        yb = log_prices(cb[-beta_lb:])
-        beta, alpha, r2 = ols_beta_alpha_r2(xa, yb)
-
-        spread = spread_series_from_prices(ca, cb, beta, alpha)
-        z = zscore_last(spread, lookback=max(50, z_lb))
-        hl = half_life_minutes(spread, BAR_INTERVAL, lookback=max(60, hl_lb))
-        return z, beta, alpha, hl, r2
-
-    ratio = [ca[i] / cb[i] if cb[i] != 0 else 0.0 for i in range(n)]
-    z = zscore_last(ratio, lookback=max(50, min(ZSCORE_LOOKBACK, n)))
-    return z, 1.0, 0.0, None, None
-
-# =========================
-# TRADING
-# =========================
-def open_pair_market(pair: Pair, st: PairState, z: float, beta: float, alpha: float) -> None:
-    if z >= 0:
-        dir_a, dir_b = -1, +1
-    else:
-        dir_a, dir_b = +1, -1
-
-    beta_eff = max(0.25, min(beta, 4.0))
-    usd_a = BASE_USD_PER_LEG
-    usd_b = BASE_USD_PER_LEG * beta_eff
-
-    st.dir_a, st.dir_b = dir_a, dir_b
-    st.beta, st.alpha = beta_eff, alpha
-    st.open = True
-    st.entry_time = time.time()
-
-    absz = abs(z)
-    st.entry_abs_z = absz
-    st.peak_abs_z = absz
-
-    if TRADING_ENABLED == 0:
-        print(
-            f"[DRY] ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
-            f"dirA={dir_a} usdA={usd_a:.2f} | dirB={dir_b} usdB={usd_b:.2f}"
-        )
-        return
-
-    print(
-        f"🚀 ENTRY {pair.a}/{pair.b} | z={z:.2f} | beta={beta_eff:.3f} alpha={alpha:.3f} | "
-        f"dirA={dir_a} usdA={usd_a:.2f} | dirB={dir_b} usdB={usd_b:.2f}"
-    )
-    open_market(pair.a, dir_a, usd_a)
-    open_market(pair.b, dir_b, usd_b)
-
-def close_pair(pair: Pair, st: PairState, reason: str) -> None:
-    st.open = False
-    st.last_close_time = time.time()
-
-    if TRADING_ENABLED == 0:
-        print(f"[DRY] EXIT {pair.a}/{pair.b} | reason={reason}")
-        return
-
-    amt_a, _ = get_position(pair.a)
-    amt_b, _ = get_position(pair.b)
-    print(f"🧯 EXIT {pair.a}/{pair.b} | reason={reason} | amtA={amt_a} amtB={amt_b}")
-    close_market_reduce_only(pair.a, amt_a)
-    close_market_reduce_only(pair.b, amt_b)
-
-def should_no_progress_exit(st: PairState, abs_z_now: float, held_min: float) -> bool:
-    if held_min < NO_PROGRESS_MIN:
-        return False
-    peak = st.peak_abs_z if st.peak_abs_z > 0 else st.entry_abs_z
-    if peak <= 0:
-        return False
-    improve_from_peak = (peak - abs_z_now) / peak
-    return improve_from_peak < MIN_IMPROVE_PCT
-
-# ---- NEW: overlap helper ----
-def get_open_symbols(pairs: List[Pair], states: Dict[str, PairState]) -> set:
-    """
-    Currently OPEN pairs' symbols set.
-    """
-    s = set()
-    for p in pairs:
-        key = f"{p.a}/{p.b}"
-        st = states.get(key)
-        if st and st.open:
-            s.add(p.a)
-            s.add(p.b)
-    return s
-
-# =========================
-# MAIN
-# =========================
+# =========================================================
+# MAIN LOOP
+# =========================================================
 def main():
     sync_time()
+    st = load_state()
 
-    print("✅ Auto Pair Trading Bot (OLS Spread Z + HL + R2/Beta Filters + Dynamic Exits (Peak) + DRY State + OVERLAP GUARD)")
+    print("✅ DCA SCALP Bot — AUTO SYMBOL + AUTO SIDE (Trend/Pullback/Reversal) + PnL Exit + Exposure Guard")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
-    print(f"Universe quote={UNIVERSE_QUOTE}, TOP_N_COINS={TOP_N_COINS}, SELECT_TOP_PAIRS={SELECT_TOP_PAIRS}")
-    print(f"BAR_INTERVAL={BAR_INTERVAL}, LOOKBACK_MINUTES={LOOKBACK_MINUTES}, CHECK_SEC={CHECK_SEC}")
-    print(f"ENTRY_Z={ENTRY_Z}, EXIT_Z={EXIT_Z}, TP_USD={TP_USD}, SL_USD={SL_USD}, MAX_HOLD_MIN={MAX_HOLD_MIN}")
-    print(f"BASE_USD_PER_LEG={BASE_USD_PER_LEG}, MAX_OPEN_PAIRS={MAX_OPEN_PAIRS}, COOLDOWN_MIN={COOLDOWN_MIN}")
-    print(f"PAIR_REFRESH_MIN={PAIR_REFRESH_MIN} | SIGNAL_MODE={SIGNAL_MODE} | BETA_LOOKBACK={BETA_LOOKBACK} | ZSCORE_LOOKBACK={ZSCORE_LOOKBACK}")
-    print(f"HL_LOOKBACK={HL_LOOKBACK} | HL_MIN_MIN={HL_MIN_MIN} | HL_MAX_MIN={HL_MAX_MIN}")
-    print(f"R2_MIN={R2_MIN} | BETA_MAX={BETA_MAX}")
-    print(f"NO_PROGRESS_MIN={NO_PROGRESS_MIN} | MIN_IMPROVE_PCT={MIN_IMPROVE_PCT} | Z_STOP={Z_STOP}")
+    print(f"Universe={UNIVERSE_QUOTE} TOP_N_COINS={TOP_N_COINS} | TREND={TREND_INTERVAL} EMA{TREND_EMA} | ENTRY={ENTRY_INTERVAL} EMA{FAST_EMA}/{SLOW_EMA}")
+    print(f"Pullback: lookback={PULLBACK_LOOKBACK_BARS} min={PULLBACK_MIN_PCT*100:.2f}% max={PULLBACK_MAX_PCT*100:.2f}% | Cross lookback={CROSS_LOOKBACK_BARS} confirm={REVERSE_CONFIRM_BARS}")
+    print(f"DCA: base={DCA_BASE_USD} step={DCA_STEP_PCT*100:.2f}% mult={DCA_MULT} maxLv={DCA_MAX_LEVELS}")
+    print(f"PnL Exit: use={USE_PNL_EXIT} TP={TP_PNL_USD} SL={SL_PNL_USD} | Price Exit: use={USE_PRICE_EXIT} TP%={TP_PCT*100:.2f} Stop%={HARD_STOP_PCT*100:.2f} TimeStop={TIME_STOP_MIN}m")
+    print(f"Exposure: max={MAX_TOTAL_USD_EXPOSURE} action={EXPOSURE_ACTION} | Cooldown={COOLDOWN_MIN}m Reselect={RESELECT_MIN}m")
+    print(f"Vol: lookbackBars={VOL_LOOKBACK_BARS} min={VOL_MIN} max={VOL_MAX} | CHECK_SEC={CHECK_SEC}")
 
-    pairs = refresh_pairs()
-    if not pairs:
-        raise SystemExit("No pairs selected. Try increasing TOP_N_COINS or LOOKBACK_MINUTES.")
-
-    print("✅ Selected pairs:")
-    for p in pairs:
-        print(f"  - {p.a}/{p.b}")
-
-    if TRADING_ENABLED == 1:
-        uniq = set()
-        for p in pairs:
-            uniq.add(p.a); uniq.add(p.b)
-        for sym in sorted(uniq):
+    # recover if bot restarts with an open position
+    if TRADING_ENABLED == 1 and RECOVER_OPEN_POS == 1:
+        sym = get_any_open_position_symbol()
+        if sym:
+            st.symbol = sym
+            amt, pnl = get_position(sym)
+            st.open = (amt != 0.0)
+            st.side = +1 if amt > 0 else -1
+            if st.entry_time == 0.0:
+                st.entry_time = time.time()
+            if st.level == 0:
+                st.level = 1
+            if st.total_usd_est == 0.0:
+                # unknown; set to base as conservative
+                st.total_usd_est = DCA_BASE_USD
+            if st.avg_entry_est == 0.0:
+                st.avg_entry_est = get_mark(sym)
+            st.next_add_price = dca_next_add_price(st.avg_entry_est, st.side, DCA_STEP_PCT, st.level)
             ensure_symbol_settings(sym)
-
-    states: Dict[str, PairState] = {f"{p.a}/{p.b}": PairState() for p in pairs}
-    last_refresh_ts = time.time()
+            save_state(st)
+            print(f"⚠️ RECOVERED open position: {sym} amt={amt} pnl={pnl:.2f} inferredSide={'LONG' if st.side>0 else 'SHORT'}")
 
     while True:
         try:
-            open_count = sum(1 for s in states.values() if s.open)
-            any_open_state = any(s.open for s in states.values())
+            now = time.time()
 
-            if (time.time() - last_refresh_ts) >= (PAIR_REFRESH_MIN * 60) and not any_open_state:
-                print("🔄 REFRESH: selecting new pairs...")
-                new_pairs = refresh_pairs()
-                if new_pairs:
-                    pairs = new_pairs
-                    states = {f"{p.a}/{p.b}": PairState() for p in pairs}
-                    print("✅ REFRESH done. New pairs:")
-                    for p in pairs:
-                        print(f"  - {p.a}/{p.b}")
-                    if TRADING_ENABLED == 1:
-                        uniq = set()
-                        for p in pairs:
-                            uniq.add(p.a); uniq.add(p.b)
-                        for sym in sorted(uniq):
-                            ensure_symbol_settings(sym)
+            # cooldown after close
+            if st.last_close_time and (now - st.last_close_time) < (COOLDOWN_MIN * 60):
+                time.sleep(CHECK_SEC)
+                continue
+
+            # if live, trust exchange open status
+            if TRADING_ENABLED == 1 and st.symbol:
+                amt, pnl = get_position(st.symbol)
+                st.open = (amt != 0.0)
+                # if exchange says flat but state open, reset
+                if not st.open and st.level > 0:
+                    reset_position_state(st)
+                    st.last_close_time = now
+                    save_state(st)
+
+            # ==========================================
+            # FLAT: scan and enter (coin selection == entry opportunity)
+            # ==========================================
+            if not st.open:
+                # throttle scanning
+                if st.last_scan_ts and (now - st.last_scan_ts) < (RESELECT_MIN * 60):
+                    time.sleep(CHECK_SEC)
+                    continue
+
+                st.last_scan_ts = now
+                cand = scan_for_entry_candidate()
+                if not cand:
+                    print("SCAN: no entry candidates now.")
+                    save_state(st)
+                    time.sleep(CHECK_SEC)
+                    continue
+
+                sym, side, score, pb, vol = cand
+                st.symbol = sym
+                st.side = side
+                ensure_symbol_settings(sym)
+
+                side_txt = "LONG" if side > 0 else "SHORT"
+                mark = get_mark(sym)
+
+                # initialize DCA state
+                st.open = True
+                st.entry_time = now
+                st.level = 1
+                st.avg_entry_est = mark
+                st.pos_qty_est = 0.0
+                st.total_usd_est = DCA_BASE_USD
+                st.next_add_price = dca_next_add_price(st.avg_entry_est, st.side, DCA_STEP_PCT, st.level)
+
+                if TRADING_ENABLED == 0:
+                    print(f"[DRY] ENTRY {sym} side={side_txt} score={score:.3f} pb={pb*100:.2f}% vol={vol:.5f} mark={mark:.6f} usd={DCA_BASE_USD:.2f} nextAdd={st.next_add_price:.6f}")
                 else:
-                    print("⚠️ REFRESH failed (no pairs). Keeping current list.")
-                last_refresh_ts = time.time()
+                    print(f"🚀 ENTRY {sym} side={side_txt} score={score:.3f} pb={pb*100:.2f}% vol={vol:.5f} mark={mark:.6f} usd={DCA_BASE_USD:.2f} nextAdd={st.next_add_price:.6f}")
+                    open_market(sym, st.side, DCA_BASE_USD)
 
-            for p in pairs:
-                key = f"{p.a}/{p.b}"
-                st = states.setdefault(key, PairState())
+                save_state(st)
+                time.sleep(1)
+                continue
 
-                if st.last_close_time and (time.time() - st.last_close_time) < (COOLDOWN_MIN * 60):
+            # ==========================================
+            # OPEN: manage position (PnL exits + price safety + DCA adds)
+            # ==========================================
+            sym = st.symbol
+            if not sym:
+                # shouldn't happen, but keep safe
+                reset_position_state(st)
+                save_state(st)
+                time.sleep(CHECK_SEC)
+                continue
+
+            mark = get_mark(sym)
+            held_min = (now - st.entry_time) / 60.0 if st.entry_time else 0.0
+            side_txt = "LONG" if st.side > 0 else "SHORT"
+
+            # Live PnL exits (primary)
+            if TRADING_ENABLED == 1 and USE_PNL_EXIT == 1:
+                amt, pnl = get_position(sym)
+
+                # one-leg safety (shouldn't happen for single symbol)
+                if amt == 0.0:
+                    print("⚠️ Exchange shows flat while state open -> reset")
+                    reset_position_state(st)
+                    st.last_close_time = time.time()
+                    save_state(st)
+                    time.sleep(2)
                     continue
 
-                # ===== LIVE: exchange truth =====
+                print(f"POS {sym} {side_txt} | mark={mark:.6f} | pnl={pnl:.2f} | lv={st.level}/{DCA_MAX_LEVELS} | estExp={st.total_usd_est:.2f} | nextAdd={st.next_add_price:.6f} | held={held_min:.1f}m")
+
+                if pnl >= TP_PNL_USD:
+                    print(f"✅ TP_PNL hit pnl={pnl:.2f} -> close")
+                    close_market_reduce_only(sym, amt)
+                    reset_position_state(st)
+                    st.last_close_time = time.time()
+                    save_state(st)
+                    time.sleep(2)
+                    continue
+
+                if pnl <= SL_PNL_USD:
+                    print(f"🛑 SL_PNL hit pnl={pnl:.2f} -> close")
+                    close_market_reduce_only(sym, amt)
+                    reset_position_state(st)
+                    st.last_close_time = time.time()
+                    save_state(st)
+                    time.sleep(2)
+                    continue
+
+            else:
+                # DRY or no-PnL mode: show status
+                print(f"POS {sym} {side_txt} | mark={mark:.6f} | lv={st.level}/{DCA_MAX_LEVELS} | estExp={st.total_usd_est:.2f} | nextAdd={st.next_add_price:.6f} | held={held_min:.1f}m")
+
+            # Optional price-based safety exits (works in DRY, can remain as extra safety in live)
+            if USE_PRICE_EXIT == 1 and st.avg_entry_est > 0:
+                tp_px = price_tp(st.avg_entry_est, st.side, TP_PCT)
+                sl_px = price_stop(st.avg_entry_est, st.side, HARD_STOP_PCT)
+
+                if (st.side > 0 and mark >= tp_px) or (st.side < 0 and mark <= tp_px):
+                    print("✅ PRICE_TP -> close")
+                    if TRADING_ENABLED == 1:
+                        amt, _ = get_position(sym)
+                        close_market_reduce_only(sym, amt)
+                    reset_position_state(st)
+                    st.last_close_time = time.time()
+                    save_state(st)
+                    time.sleep(2)
+                    continue
+
+                if (st.side > 0 and mark <= sl_px) or (st.side < 0 and mark >= sl_px):
+                    print("🛑 PRICE_STOP -> close")
+                    if TRADING_ENABLED == 1:
+                        amt, _ = get_position(sym)
+                        close_market_reduce_only(sym, amt)
+                    reset_position_state(st)
+                    st.last_close_time = time.time()
+                    save_state(st)
+                    time.sleep(2)
+                    continue
+
+            if held_min >= TIME_STOP_MIN:
+                print("⏳ TIME_STOP -> close")
                 if TRADING_ENABLED == 1:
-                    amt_a, pnl_a = get_position(p.a)
-                    amt_b, pnl_b = get_position(p.b)
+                    amt, _ = get_position(sym)
+                    close_market_reduce_only(sym, amt)
+                reset_position_state(st)
+                st.last_close_time = time.time()
+                save_state(st)
+                time.sleep(2)
+                continue
 
-                    if (amt_a == 0) != (amt_b == 0):
-                        print(f"⚠️ ONE-LEG RISK {key} | amtA={amt_a} amtB={amt_b} -> forcing close")
-                        close_pair(p, st, reason="ONE_LEG_RISK")
+            # DCA add logic
+            can_add = (st.level < DCA_MAX_LEVELS)
+            hit_add = (st.side > 0 and mark <= st.next_add_price) or (st.side < 0 and mark >= st.next_add_price)
+
+            if can_add and hit_add:
+                usd_add = DCA_BASE_USD * (DCA_MULT ** (st.level - 1))  # level=1 already used for initial
+                projected = st.total_usd_est + usd_add
+
+                if projected > MAX_TOTAL_USD_EXPOSURE:
+                    if EXPOSURE_ACTION == "FORCE_CLOSE":
+                        print(f"🧯 EXPOSURE LIMIT -> FORCE_CLOSE | est={st.total_usd_est:.2f} + add={usd_add:.2f} > max={MAX_TOTAL_USD_EXPOSURE:.2f}")
+                        if TRADING_ENABLED == 1:
+                            amt, _ = get_position(sym)
+                            close_market_reduce_only(sym, amt)
+                        reset_position_state(st)
+                        st.last_close_time = time.time()
+                        save_state(st)
+                        time.sleep(2)
+                        continue
+                    else:
+                        print(f"⛔ EXPOSURE LIMIT -> STOP_ADD | est={st.total_usd_est:.2f} + add={usd_add:.2f} > max={MAX_TOTAL_USD_EXPOSURE:.2f}")
+                        time.sleep(CHECK_SEC)
                         continue
 
-                    total_pnl = pnl_a + pnl_b
-                    st.open = (amt_a != 0 and amt_b != 0)
+                # proceed with add
+                st.level += 1
+                st.total_usd_est = projected
 
-                    if st.open:
-                        held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
-                        z, beta, alpha, hl, r2 = compute_signal(p)
-                        abs_z = abs(z)
-                        st.peak_abs_z = max(st.peak_abs_z, abs_z)
+                # update avg estimate for decision logic
+                add_qty = (usd_add / mark) if mark > 0 else 0.0
+                total_cost = st.avg_entry_est * st.pos_qty_est + mark * add_qty
+                st.pos_qty_est += add_qty
+                if st.pos_qty_est > 0:
+                    st.avg_entry_est = total_cost / st.pos_qty_est
 
-                        print(
-                            f"PAIR {key} | PNL={total_pnl:.2f} | z={z:.2f} | absz={abs_z:.2f} | "
-                            f"entryAbsZ={st.entry_abs_z:.2f} | peakAbsZ={st.peak_abs_z:.2f} | "
-                            f"beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m | held={held_min:.1f}m"
-                        )
+                st.next_add_price = dca_next_add_price(st.avg_entry_est, st.side, DCA_STEP_PCT, st.level)
 
-                        if total_pnl >= TP_USD:
-                            close_pair(p, st, reason="TP_USD"); time.sleep(2); continue
-                        if total_pnl <= SL_USD:
-                            close_pair(p, st, reason="SL_USD"); time.sleep(2); continue
+                if TRADING_ENABLED == 0:
+                    print(f"[DRY] DCA ADD {sym} {side_txt} | lv={st.level} usd={usd_add:.2f} mark={mark:.6f} newAvg={st.avg_entry_est:.6f} nextAdd={st.next_add_price:.6f} estExp={st.total_usd_est:.2f}")
+                else:
+                    print(f"➕ DCA ADD {sym} {side_txt} | lv={st.level} usd={usd_add:.2f} mark={mark:.6f} newAvg={st.avg_entry_est:.6f} nextAdd={st.next_add_price:.6f} estExp={st.total_usd_est:.2f}")
+                    open_market(sym, st.side, usd_add)
 
-                        if abs_z <= EXIT_Z:
-                            close_pair(p, st, reason="EXIT_Z"); time.sleep(2); continue
-                        if abs_z >= Z_STOP:
-                            close_pair(p, st, reason="Z_STOP"); time.sleep(2); continue
-                        if should_no_progress_exit(st, abs_z, held_min):
-                            close_pair(p, st, reason="NO_PROGRESS"); time.sleep(2); continue
-
-                        if held_min >= MAX_HOLD_MIN:
-                            close_pair(p, st, reason="TIME_STOP"); time.sleep(2); continue
-                        continue
-
-                    if open_count >= MAX_OPEN_PAIRS:
-                        continue
-
-                    z, beta, alpha, hl, r2 = compute_signal(p)
-                    abs_z = abs(z)
-                    print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m")
-
-                    if abs_z >= ENTRY_Z:
-                        if hl is None or hl < HL_MIN_MIN or hl > HL_MAX_MIN:
-                            print(f"⛔ HL_FILTER {key} | hl={fmt_opt(hl,1)}m (min={HL_MIN_MIN} max={HL_MAX_MIN}) -> skip entry")
-                            continue
-                        if SIGNAL_MODE == "SPREAD_OLS":
-                            if r2 is None or r2 < R2_MIN:
-                                print(f"⛔ R2_FILTER {key} | r2={fmt_opt(r2,2)} (min={R2_MIN}) -> skip entry")
-                                continue
-                            if beta > BETA_MAX:
-                                print(f"⛔ BETA_FILTER {key} | beta={beta:.3f} (max={BETA_MAX}) -> skip entry")
-                                continue
-
-                        # ---- NEW: overlap guard (LIVE) ----
-                        open_syms = get_open_symbols(pairs, states)
-                        if (p.a in open_syms) or (p.b in open_syms):
-                            print(f"⛔ OVERLAP_SKIP {key} | openSymbols={sorted(list(open_syms))} -> skip entry")
-                            continue
-
-                        open_pair_market(p, st, z, beta, alpha)
-                        open_count += 1
-                        time.sleep(1)
-                    continue
-
-                # ===== DRY: simulated engine =====
-                if st.open:
-                    held_min = (time.time() - st.entry_time) / 60 if st.entry_time else 0.0
-                    z, beta, alpha, hl, r2 = compute_signal(p)
-                    abs_z = abs(z)
-                    st.peak_abs_z = max(st.peak_abs_z, abs_z)
-
-                    print(
-                        f"[DRY] PAIR {key} | z={z:.2f} | absz={abs_z:.2f} | entryAbsZ={st.entry_abs_z:.2f} | "
-                        f"peakAbsZ={st.peak_abs_z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | "
-                        f"hl={fmt_opt(hl,1)}m | held={held_min:.1f}m"
-                    )
-
-                    if abs_z <= EXIT_Z:
-                        close_pair(p, st, reason="EXIT_Z"); time.sleep(1); continue
-                    if abs_z >= Z_STOP:
-                        close_pair(p, st, reason="Z_STOP"); time.sleep(1); continue
-                    if should_no_progress_exit(st, abs_z, held_min):
-                        close_pair(p, st, reason="NO_PROGRESS"); time.sleep(1); continue
-                    if held_min >= MAX_HOLD_MIN:
-                        close_pair(p, st, reason="TIME_STOP"); time.sleep(1); continue
-                    continue
-
-                if open_count >= MAX_OPEN_PAIRS:
-                    continue
-
-                z, beta, alpha, hl, r2 = compute_signal(p)
-                abs_z = abs(z)
-                print(f"SCAN {key} | z={z:.2f} | beta={beta:.3f} | r2={fmt_opt(r2,2)} | hl={fmt_opt(hl,1)}m")
-
-                if abs_z >= ENTRY_Z:
-                    if hl is None or hl < HL_MIN_MIN or hl > HL_MAX_MIN:
-                        print(f"⛔ HL_FILTER {key} | hl={fmt_opt(hl,1)}m (min={HL_MIN_MIN} max={HL_MAX_MIN}) -> skip entry")
-                        continue
-                    if SIGNAL_MODE == "SPREAD_OLS":
-                        if r2 is None or r2 < R2_MIN:
-                            print(f"⛔ R2_FILTER {key} | r2={fmt_opt(r2,2)} (min={R2_MIN}) -> skip entry")
-                            continue
-                        if beta > BETA_MAX:
-                            print(f"⛔ BETA_FILTER {key} | beta={beta:.3f} (max={BETA_MAX}) -> skip entry")
-                            continue
-
-                    # ---- NEW: overlap guard (DRY) ----
-                    open_syms = get_open_symbols(pairs, states)
-                    if (p.a in open_syms) or (p.b in open_syms):
-                        print(f"⛔ OVERLAP_SKIP {key} | openSymbols={sorted(list(open_syms))} -> skip entry")
-                        continue
-
-                    open_pair_market(p, st, z, beta, alpha)
-                    open_count += 1
-                    time.sleep(1)
+                save_state(st)
+                time.sleep(1)
 
             time.sleep(CHECK_SEC)
 
