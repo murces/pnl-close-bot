@@ -48,16 +48,23 @@ COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
 # How often to rescan (minutes)
 RESELECT_MIN = int(os.getenv("RESELECT_MIN", "5"))
 
-# Timeframes
-TREND_INTERVAL = os.getenv("TREND_INTERVAL", "15m")
-ENTRY_INTERVAL = os.getenv("ENTRY_INTERVAL", "1m")
+# Timeframes (normalize supports "15min" -> "15m")
+def normalize_interval(iv: str) -> str:
+    s = (iv or "").strip().lower()
+    s = s.replace("mins", "m").replace("min", "m")
+    s = s.replace("minutes", "m").replace("minute", "m")
+    s = s.replace(" ", "")
+    return s
+
+TREND_INTERVAL = normalize_interval(os.getenv("TREND_INTERVAL", "15m"))
+ENTRY_INTERVAL = normalize_interval(os.getenv("ENTRY_INTERVAL", "1m"))
 
 # Trend / entry
 TREND_EMA = int(os.getenv("TREND_EMA", "200"))
 FAST_EMA = int(os.getenv("FAST_EMA", "20"))
 SLOW_EMA = int(os.getenv("SLOW_EMA", "50"))
 
-# Lookback large enough for EMA200 on 15m (>= ~250 bars)
+# Lookback large enough for EMA200 on 15m
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "12000"))
 
 # Pullback
@@ -112,6 +119,10 @@ DEBUG_EVERY_SEC = int(os.getenv("DEBUG_EVERY_SEC", "30"))
 STATE_PATH = os.getenv("STATE_PATH", "dca_portfolio_state.json")
 RECOVER_OPEN_POS = int(os.getenv("RECOVER_OPEN_POS", "1"))
 
+# Scan tuning (API load control)
+STAGE2_LIMIT = int(os.getenv("STAGE2_LIMIT", "30"))          # max shortlist for 1m checks
+TICKER_CACHE_SEC = int(os.getenv("TICKER_CACHE_SEC", "60"))  # futures_ticker cache TTL
+
 # =========================================================
 # CACHES
 # =========================================================
@@ -121,12 +132,12 @@ _KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, List[float]]] = {}
 
 # Bulk caches to reduce API calls
 _MARKS_CACHE: Dict[str, float] = {}
-_POS_CACHE: Dict[str, Tuple[float, float]] = {}
+# (amt, pnl, entry_price)
+_POS_CACHE: Dict[str, Tuple[float, float, float]] = {}
 _LAST_BULK_TS: float = 0.0
 
 _TICKER_CACHE: List[dict] = []
 _TICKER_CACHE_TS: float = 0.0
-TICKER_CACHE_SEC = int(os.getenv("TICKER_CACHE_SEC", "60"))
 
 # Persistent denylist (runtime) incl -4411 auto-deny
 _DENY_RUNTIME: Set[str] = set(s.upper() for s in DENYLIST_ENV if s)
@@ -154,7 +165,7 @@ class PortfolioState:
     trades: Dict[str, TradeState]  # key=symbol
     cooldowns: Dict[str, float]    # symbol -> cooldown_until_ts
     last_scan_ts: float = 0.0
-    deny_runtime: List[str] = None  # persisted runtime denylist
+    deny_runtime: List[str] = None
 
 
 # =========================================================
@@ -175,7 +186,6 @@ def ensure_one_way_mode() -> None:
     Bot assumes ONE-WAY. We only warn (don't try to change) to avoid unexpected account changes.
     """
     try:
-        # python-binance: futures_get_position_mode() -> {'dualSidePosition': True/False}
         mode = client.futures_get_position_mode(recvWindow=RECV_WINDOW)
         dual = bool(mode.get("dualSidePosition", False))
         if dual:
@@ -219,7 +229,7 @@ def refresh_bulk_caches(force: bool = False) -> None:
 
     try:
         poss = client.futures_position_information(recvWindow=RECV_WINDOW)  # list of all positions
-        tmp: Dict[str, Tuple[float, float]] = {}
+        tmp: Dict[str, Tuple[float, float, float]] = {}
         for p in poss:
             sym = p.get("symbol", "")
             if not sym:
@@ -227,7 +237,8 @@ def refresh_bulk_caches(force: bool = False) -> None:
             try:
                 amt = float(p.get("positionAmt", "0") or 0.0)
                 pnl = float(p.get("unRealizedProfit", "0") or 0.0)
-                tmp[sym] = (amt, pnl)
+                ep = float(p.get("entryPrice", "0") or 0.0)
+                tmp[sym] = (amt, pnl, ep)
             except Exception:
                 continue
         _POS_CACHE = tmp
@@ -241,8 +252,8 @@ def get_mark_cached(symbol: str) -> float:
     return float(_MARKS_CACHE.get(symbol, 0.0))
 
 
-def get_position_cached(symbol: str) -> Tuple[float, float]:
-    return _POS_CACHE.get(symbol, (0.0, 0.0))
+def get_position_cached(symbol: str) -> Tuple[float, float, float]:
+    return _POS_CACHE.get(symbol, (0.0, 0.0, 0.0))
 
 
 def get_step_min(symbol: str) -> Tuple[float, float]:
@@ -299,7 +310,7 @@ def open_market(symbol: str, direction: int, usd: float) -> None:
     if TRADING_ENABLED == 0:
         return
 
-    amt, _ = get_position_cached(symbol)
+    amt, _, _ = get_position_cached(symbol)
     if amt != 0.0:
         existing_dir = 1 if amt > 0 else -1
         if existing_dir != direction:
@@ -320,7 +331,6 @@ def open_market(symbol: str, direction: int, usd: float) -> None:
         )
     except Exception as e:
         msg = str(e)
-        # Agreement required
         if "code=-4411" in msg and DENY_ON_4411 == 1:
             raise RuntimeError(f"[AGREEMENT_REQUIRED -4411] {symbol}")
         raise
@@ -485,15 +495,23 @@ def get_top_symbols_by_volume(quote: str, top_n: int) -> List[str]:
 # SIGNAL: trend + pullback + reversal + vol
 # =========================================================
 def trend_direction(symbol: str) -> Optional[int]:
-    closes = fetch_closes(symbol, TREND_INTERVAL, LOOKBACK_MINUTES)
+    try:
+        closes = fetch_closes(symbol, TREND_INTERVAL, LOOKBACK_MINUTES)
+    except Exception as e:
+        if DEBUG_SCAN == 1:
+            print(f"SCAN_DEBUG_ERR fetch_closes trend failed {symbol} {TREND_INTERVAL}: {e}")
+        return None
+
     need = max(TREND_EMA + 20, 250)
     if len(closes) < need:
         return None
+
     w = closes[-max(TREND_EMA * 3, 450):]
     et = ema(w, TREND_EMA)
     px = w[-1]
     if et <= 0:
         return None
+
     return +1 if px > et else (-1 if px < et else None)
 
 
@@ -587,7 +605,7 @@ def scan_candidates(
     ps: PortfolioState,
     need_slots: int,
     side_filter: Optional[int] = None,
-    stage2_limit: int = 30,  # Only run 1m entry checks for top-N trend-matching symbols
+    stage2_limit: int = STAGE2_LIMIT,
 ) -> List[Tuple[float, str, int, float, float]]:
     """
     Returns candidates sorted by score desc:
@@ -601,11 +619,9 @@ def scan_candidates(
 
     open_syms = set(ps.trades.keys())
 
-    # Stage 1: trend only (cheap-ish, still kline calls but fewer)
+    # Stage 1: trend only
     stage1: List[Tuple[int, str]] = []  # (idx, sym)
-    counters = {
-        "seen": 0, "trend_fail": 0, "skipped_open": 0, "skipped_cd": 0, "skipped_side": 0,
-    }
+    counters = {"seen": 0, "trend_fail": 0, "skipped_open": 0, "skipped_cd": 0, "skipped_side": 0}
 
     for idx, sym in enumerate(tops):
         counters["seen"] += 1
@@ -630,14 +646,16 @@ def scan_candidates(
                 continue
 
             stage1.append((idx, sym))
-        except Exception:
+        except Exception as e:
             counters["trend_fail"] += 1
+            if DEBUG_SCAN == 1 and counters["trend_fail"] <= 3:
+                print(f"SCAN_DEBUG_ERR trend_direction failed {sym}: {e}")
             continue
 
         if len(stage1) >= stage2_limit:
             break
 
-    # Stage 2: entry filters (1m) only for stage1 shortlist
+    # Stage 2: entry filters only for stage1 shortlist
     data_fail = pullback_fail = reversal_fail = vol_fail = ok = 0
     candidates: List[Tuple[float, str, int, float, float]] = []
 
@@ -711,8 +729,7 @@ def recover_live_positions(ps: PortfolioState) -> None:
     refresh_bulk_caches(force=True)
 
     try:
-        # Use bulk cache
-        for sym, (amt, pnl) in _POS_CACHE.items():
+        for sym, (amt, pnl, entry_px) in _POS_CACHE.items():
             if not sym or not sym.endswith(UNIVERSE_QUOTE):
                 continue
             if excluded_symbol(sym):
@@ -722,7 +739,6 @@ def recover_live_positions(ps: PortfolioState) -> None:
 
             side = +1 if amt > 0 else -1
 
-            # respect caps on recovery
             longs_open, shorts_open = count_sides(ps)
             if side > 0 and longs_open >= MAX_OPEN_LONG:
                 continue
@@ -739,8 +755,10 @@ def recover_live_positions(ps: PortfolioState) -> None:
 
             ensure_symbol_settings(sym)
 
-            # Estimate qty from current exposure base (best-effort)
-            entry_qty_est = (DCA_BASE_USD / mark) if mark > 0 else 0.0
+            # Use exchange entry price if available; else mark
+            ref = entry_px if entry_px > 0 else mark
+
+            entry_qty_est = (DCA_BASE_USD / ref) if ref > 0 else 0.0
 
             ts = TradeState(
                 symbol=sym,
@@ -748,13 +766,13 @@ def recover_live_positions(ps: PortfolioState) -> None:
                 open=True,
                 entry_time=time.time(),
                 level=1,
-                next_add_price=dca_next_add_price(mark, side, DCA_STEP_PCT, 1),
-                avg_entry_est=mark,
-                pos_qty_est=entry_qty_est,  # ✅ important for avg tracking
+                next_add_price=dca_next_add_price(ref, side, DCA_STEP_PCT, 1),
+                avg_entry_est=ref,
+                pos_qty_est=entry_qty_est,
                 usd_est=DCA_BASE_USD,
             )
             ps.trades[sym] = ts
-            print(f"⚠️ RECOVERED {sym} {'LONG' if side>0 else 'SHORT'} amt={amt} pnl={pnl:.2f} mark={mark:.6f}")
+            print(f"⚠️ RECOVERED {sym} {'LONG' if side>0 else 'SHORT'} amt={amt} pnl={pnl:.2f} entry={entry_px:.6f} mark={mark:.6f}")
 
     except Exception as e:
         print(f"⚠️ recover failed: {e}")
@@ -769,7 +787,7 @@ def close_trade(ps: PortfolioState, sym: str, reason: str) -> None:
         return
     print(f"🧯 CLOSE {sym} reason={reason}")
     if TRADING_ENABLED == 1:
-        amt, _ = get_position_cached(sym)
+        amt, _, _ = get_position_cached(sym)
         if amt != 0.0:
             close_market_reduce_only(sym, amt)
 
@@ -777,19 +795,15 @@ def close_trade(ps: PortfolioState, sym: str, reason: str) -> None:
     ps.trades.pop(sym, None)
 
 
-def add_deny_and_cooldown(sym: str, hours: int, reason: str) -> None:
+def add_deny(sym: str, reason: str) -> None:
     _DENY_RUNTIME.add(sym.upper())
-    print(f"⛔ DENY {sym} for {hours}h reason={reason}")
-    # We'll also use cooldown timestamp in state via ps.cooldowns (handled where called)
+    print(f"⛔ DENY {sym} reason={reason}")
 
 
 def force_close_if_crossed(ps: PortfolioState, sym: str, expected_side: int) -> bool:
-    """
-    Returns True if force-closed due to crossed direction.
-    """
     if TRADING_ENABLED == 0:
         return False
-    amt, _ = get_position_cached(sym)
+    amt, _, _ = get_position_cached(sym)
     if amt == 0.0:
         return False
     exch_side = +1 if amt > 0 else -1
@@ -870,6 +884,7 @@ def main():
     print(f"Exposure: perTradeMax={MAX_USD_PER_TRADE} totalMax={MAX_TOTAL_USD_EXPOSURE} action={EXPOSURE_ACTION}")
     print(f"COOLDOWN_MIN(per symbol)={COOLDOWN_MIN} | RESELECT_MIN={RESELECT_MIN} | CHECK_SEC={CHECK_SEC} | DEBUG_SCAN={DEBUG_SCAN}")
     print(f"DENY_ON_4411={DENY_ON_4411} AGREEMENT_COOLDOWN_HOURS={AGREEMENT_COOLDOWN_HOURS}")
+    print(f"SCAN_TUNING: STAGE2_LIMIT={STAGE2_LIMIT} | TICKER_CACHE_SEC={TICKER_CACHE_SEC}")
 
     # initial bulk refresh
     refresh_bulk_caches(force=True)
@@ -905,25 +920,25 @@ def main():
             to_close: List[Tuple[str, str]] = []
 
             for sym, ts in list(ps.trades.items()):
-                # crossed guard
+                # safety: crossed guard
                 if force_close_if_crossed(ps, sym, ts.side):
                     continue
 
                 mark = get_mark_cached(sym)
                 if mark <= 0:
-                    # if mark missing, skip this cycle
                     continue
+
+                amt, pnl, entry_px = get_position_cached(sym)
 
                 held_min = (now - ts.entry_time) / 60.0 if ts.entry_time else 0.0
                 side_txt = "LONG" if ts.side > 0 else "SHORT"
 
                 if TRADING_ENABLED == 1 and USE_PNL_EXIT == 1:
-                    amt, pnl = get_position_cached(sym)
                     if amt == 0.0:
                         to_close.append((sym, "EXCHANGE_FLAT"))
                         continue
 
-                    print(f"POS {sym} {side_txt} | mark={mark:.6f} | pnl={pnl:.2f} | lv={ts.level}/{DCA_MAX_LEVELS} | estExp={ts.usd_est:.2f} | nextAdd={ts.next_add_price:.6f} | held={held_min:.1f}m")
+                    print(f"POS {sym} {side_txt} | mark={mark:.6f} | pnl={pnl:.2f} | entry={entry_px:.6f} | lv={ts.level}/{DCA_MAX_LEVELS} | estExp={ts.usd_est:.2f} | nextAdd={ts.next_add_price:.6f} | held={held_min:.1f}m")
 
                     if pnl >= TP_PNL_USD:
                         to_close.append((sym, "TP_PNL"))
@@ -932,12 +947,14 @@ def main():
                         to_close.append((sym, "SL_PNL"))
                         continue
                 else:
-                    print(f"POS {sym} {side_txt} | mark={mark:.6f} | lv={ts.level}/{DCA_MAX_LEVELS} | estExp={ts.usd_est:.2f} | nextAdd={ts.next_add_price:.6f} | held={held_min:.1f}m")
+                    print(f"POS {sym} {side_txt} | mark={mark:.6f} | entry={entry_px:.6f} | lv={ts.level}/{DCA_MAX_LEVELS} | estExp={ts.usd_est:.2f} | nextAdd={ts.next_add_price:.6f} | held={held_min:.1f}m")
 
-                # Price exits (based on estimated avg)
-                if USE_PRICE_EXIT == 1 and ts.avg_entry_est > 0:
-                    tp_px = price_tp(ts.avg_entry_est, ts.side, TP_PCT)
-                    sl_px = price_stop(ts.avg_entry_est, ts.side, HARD_STOP_PCT)
+                # Price exits (use exchange entryPrice when live)
+                ref_entry = entry_px if (TRADING_ENABLED == 1 and entry_px > 0) else ts.avg_entry_est
+
+                if USE_PRICE_EXIT == 1 and ref_entry > 0:
+                    tp_px = price_tp(ref_entry, ts.side, TP_PCT)
+                    sl_px = price_stop(ref_entry, ts.side, HARD_STOP_PCT)
 
                     if (ts.side > 0 and mark >= tp_px) or (ts.side < 0 and mark <= tp_px):
                         to_close.append((sym, "PRICE_TP"))
@@ -955,7 +972,7 @@ def main():
                 can_add = (ts.level < DCA_MAX_LEVELS)
                 hit_add = (ts.side > 0 and mark <= ts.next_add_price) or (ts.side < 0 and mark >= ts.next_add_price)
                 if can_add and hit_add:
-                    # NOTE: This keeps your original behavior: first add = base (because ts.level starts at 1)
+                    # keeps your original behavior: first add = base (since level starts at 1)
                     usd_add = DCA_BASE_USD * (DCA_MULT ** (ts.level - 1))
 
                     projected_trade = ts.usd_est + usd_add
@@ -968,11 +985,11 @@ def main():
                             print(f"⛔ EXPOSURE STOP_ADD {sym} | tradeProj={projected_trade:.2f}/{MAX_USD_PER_TRADE:.2f} totalProj={projected_total:.2f}/{MAX_TOTAL_USD_EXPOSURE:.2f}")
                         continue
 
-                    # pre-check crossed again
+                    # crossed pre-check again
                     if force_close_if_crossed(ps, sym, ts.side):
                         continue
 
-                    # update estimates BEFORE sending order (so logs show intent even if order fails)
+                    # update estimates
                     ts.level += 1
                     ts.usd_est = projected_trade
 
@@ -1001,7 +1018,6 @@ def main():
             total_slots = slots_long + slots_short
 
             if total_slots > 0:
-                # obey rescan interval
                 if ps.last_scan_ts and (now - ps.last_scan_ts) < (RESELECT_MIN * 60):
                     save_state(ps)
                     time.sleep(CHECK_SEC)
@@ -1041,7 +1057,6 @@ def main():
 
                         ensure_symbol_settings(sym)
 
-                        # refresh marks before entry decision
                         refresh_bulk_caches()
                         mark = get_mark_cached(sym)
                         if mark <= 0:
@@ -1049,7 +1064,7 @@ def main():
 
                         side_txt = "LONG" if side > 0 else "SHORT"
 
-                        # ✅ FIX: pos_qty_est must start with entry qty to keep avg correct
+                        # estimate qty for internal tracking (not used for exit in live)
                         entry_qty_est = (DCA_BASE_USD / mark) if mark > 0 else 0.0
 
                         ts = TradeState(
@@ -1060,7 +1075,7 @@ def main():
                             level=1,
                             next_add_price=dca_next_add_price(mark, side, DCA_STEP_PCT, 1),
                             avg_entry_est=mark,
-                            pos_qty_est=entry_qty_est,  # ✅ important
+                            pos_qty_est=entry_qty_est,
                             usd_est=DCA_BASE_USD,
                         )
 
@@ -1078,9 +1093,8 @@ def main():
                             except Exception as e:
                                 msg = str(e)
                                 if "[AGREEMENT_REQUIRED -4411]" in msg:
-                                    # deny + long cooldown to stop hammering
                                     ps.cooldowns[sym] = time.time() + AGREEMENT_COOLDOWN_HOURS * 3600
-                                    add_deny_and_cooldown(sym, AGREEMENT_COOLDOWN_HOURS, "AGREEMENT_REQUIRED_-4411")
+                                    add_deny(sym, "AGREEMENT_REQUIRED_-4411")
                                     continue
                                 raise
 
@@ -1096,7 +1110,6 @@ def main():
             if "code=-1021" in msg:
                 print("🔄 Timestamp issue (-1021) -> resync")
                 sync_time()
-            # small backoff
             time.sleep(2)
 
 
