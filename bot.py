@@ -19,26 +19,27 @@ if not API_KEY or not API_SECRET:
 TRADING_ENABLED = int(os.getenv("TRADING_ENABLED", "0"))  # 0=dry-run, 1=live
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "60000"))
 CHECK_SEC = int(os.getenv("CHECK_SEC", "5"))
+DEBUG_SCAN = int(os.getenv("DEBUG_SCAN", "0"))
+DEBUG_TOPK = int(os.getenv("DEBUG_TOPK", "5"))
 
-# Futures settings
-HEDGE_MODE = int(os.getenv("HEDGE_MODE", "0"))  # 0=one-way, 1=hedge
+# Futures settings (FORCED)
+HEDGE_MODE = 0  # <- FORCED one-way mode (no hedge)
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 
 # =========================================================
 # STRATEGY: DCA SCALP (ONLY) + AUTO SYMBOL + AUTO SIDE
-# Coin selection == entry opportunity scan
 # =========================================================
 UNIVERSE_QUOTE = os.getenv("UNIVERSE_QUOTE", "USDT").upper()
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "150"))
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
-RESELECT_MIN = int(os.getenv("RESELECT_MIN", "5"))  # how often re-scan when flat
+RESELECT_MIN = int(os.getenv("RESELECT_MIN", "5"))  # re-scan frequency when flat
 
 # Timeframes
-TREND_INTERVAL = os.getenv("TREND_INTERVAL", "15m")  # long-trend TF
-ENTRY_INTERVAL = os.getenv("ENTRY_INTERVAL", "1m")   # entry TF
+TREND_INTERVAL = os.getenv("TREND_INTERVAL", "15m")
+ENTRY_INTERVAL = os.getenv("ENTRY_INTERVAL", "1m")
 
-# Trend/Pullback/Reversal params
+# Trend / pullback / reversal
 TREND_EMA = int(os.getenv("TREND_EMA", "200"))
 FAST_EMA = int(os.getenv("FAST_EMA", "20"))
 SLOW_EMA = int(os.getenv("SLOW_EMA", "50"))
@@ -47,24 +48,23 @@ PULLBACK_LOOKBACK_BARS = int(os.getenv("PULLBACK_LOOKBACK_BARS", "90"))
 PULLBACK_MIN_PCT = float(os.getenv("PULLBACK_MIN_PCT", "0.20")) / 100.0
 PULLBACK_MAX_PCT = float(os.getenv("PULLBACK_MAX_PCT", "2.20")) / 100.0
 
-# Volatility filter (avoid too sleepy / too wild)
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "2880"))     # 2 days
-VOL_LOOKBACK_BARS = int(os.getenv("VOL_LOOKBACK_BARS", "180"))    # 3 hours on 1m
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "2880"))  # 2 days
+
+VOL_LOOKBACK_BARS = int(os.getenv("VOL_LOOKBACK_BARS", "180"))
 VOL_MIN = float(os.getenv("VOL_MIN", "0.0004"))
 VOL_MAX = float(os.getenv("VOL_MAX", "0.0060"))
 
-# DCA params (USDT notional per add)
+# DCA
 DCA_BASE_USD = float(os.getenv("DCA_BASE_USD", "50"))
 DCA_STEP_PCT = float(os.getenv("DCA_STEP_PCT", "0.40")) / 100.0
 DCA_MULT = float(os.getenv("DCA_MULT", "1.5"))
 DCA_MAX_LEVELS = int(os.getenv("DCA_MAX_LEVELS", "5"))
 
-# PnL-based exits (live recommended)
-USE_PNL_EXIT = int(os.getenv("USE_PNL_EXIT", "1"))  # 1=use unrealized PnL (live)
+# Exits
+USE_PNL_EXIT = int(os.getenv("USE_PNL_EXIT", "1"))  # (live)
 TP_PNL_USD = float(os.getenv("TP_PNL_USD", "8"))
 SL_PNL_USD = float(os.getenv("SL_PNL_USD", "-25"))
 
-# Optional safety exits (works also in DRY)
 USE_PRICE_EXIT = int(os.getenv("USE_PRICE_EXIT", "1"))
 TP_PCT = float(os.getenv("TP_PCT", "0.45")) / 100.0
 HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "2.00")) / 100.0
@@ -206,16 +206,27 @@ def ensure_symbol_settings(symbol: str) -> None:
             print(f"⚠️ margin type set failed {symbol}: {e}")
 
 def open_market(symbol: str, direction: int, usd: float) -> None:
+    """
+    One-way mode only. Prevents crossed/flip by requiring existing position direction to match.
+    """
     if TRADING_ENABLED == 0:
         return
+
+    # Crossed-position guard (exchange truth)
+    amt, _ = get_position(symbol)
+    if amt != 0.0:
+        existing_dir = 1 if amt > 0 else -1
+        if existing_dir != direction:
+            raise RuntimeError(f"[CROSSED_GUARD] Existing dir={existing_dir} but attempted dir={direction} on {symbol}")
+
     price = get_mark(symbol)
     qty = floor_to_step(symbol, usd / price)
     if qty <= 0:
         raise RuntimeError(f"[{symbol}] qty too small for usd={usd}")
+
     side = "BUY" if direction > 0 else "SELL"
     params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, recvWindow=RECV_WINDOW)
-    if HEDGE_MODE == 1:
-        params["positionSide"] = "LONG" if direction > 0 else "SHORT"
+    # HEDGE_MODE forced off: no positionSide
     client.futures_create_order(**params)
 
 def close_market_reduce_only(symbol: str, position_amt: float) -> None:
@@ -228,8 +239,6 @@ def close_market_reduce_only(symbol: str, position_amt: float) -> None:
     if qty <= 0:
         return
     params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, reduceOnly=True, recvWindow=RECV_WINDOW)
-    if HEDGE_MODE == 1:
-        params["positionSide"] = "LONG" if position_amt > 0 else "SHORT"
     client.futures_create_order(**params)
 
 # =========================================================
@@ -410,7 +419,7 @@ def get_top_symbols_by_volume(quote: str, top_n: int) -> List[str]:
     return [s for _, s in cand[:top_n]]
 
 # =========================================================
-# TREND + PULLBACK + REVERSAL (simplified)
+# TREND + PULLBACK + REVERSAL (simple)
 # =========================================================
 def trend_direction(symbol: str) -> Optional[int]:
     closes = fetch_closes(symbol, TREND_INTERVAL, LOOKBACK_MINUTES)
@@ -440,10 +449,6 @@ def pullback_pct(closes: List[float], trend: int) -> float:
         return (px - lo) / px if px > 0 else 0.0
 
 def reversal_ok_simple(entry_closes: List[float], trend: int) -> bool:
-    """
-    Uptrend: EMA20 > EMA50 and price > EMA20
-    Downtrend: EMA20 < EMA50 and price < EMA20
-    """
     if len(entry_closes) < max(SLOW_EMA + 50, 200):
         return False
     w = entry_closes[-max(SLOW_EMA * 6, 300):]
@@ -457,36 +462,51 @@ def reversal_ok_simple(entry_closes: List[float], trend: int) -> bool:
     else:
         return (ef < es) and (px < ef)
 
+# =========================================================
+# SCAN (with optional debug)
+# =========================================================
 def scan_for_entry_candidate() -> Optional[Tuple[str, int, float, float, float]]:
-    """
-    Returns: (symbol, side, score, pullback, vol)
-    """
     tops = get_top_symbols_by_volume(UNIVERSE_QUOTE, TOP_N_COINS)
+
+    seen = 0
+    trend_fail = 0
+    data_fail = 0
+    pullback_fail = 0
+    reversal_fail = 0
+    vol_fail = 0
+    ok = 0
+
     best = None  # (score, sym, side, pb, vol)
+    candidates: List[Tuple[float, str, int, float, float]] = []
 
     for idx, sym in enumerate(tops):
+        seen += 1
         try:
             tr = trend_direction(sym)
             if tr is None:
+                trend_fail += 1
                 continue
 
             entry_closes = fetch_closes(sym, ENTRY_INTERVAL, LOOKBACK_MINUTES)
             if len(entry_closes) < max(SLOW_EMA + 120, 250):
+                data_fail += 1
                 continue
 
             pb = pullback_pct(entry_closes, tr)
             if pb < PULLBACK_MIN_PCT or pb > PULLBACK_MAX_PCT:
+                pullback_fail += 1
                 continue
 
             if not reversal_ok_simple(entry_closes, tr):
+                reversal_fail += 1
                 continue
 
             vol = stdev_returns(entry_closes, VOL_LOOKBACK_BARS)
-            if vol > 0:
-                if vol < VOL_MIN or vol > VOL_MAX:
-                    continue
-            else:
+            if vol <= 0 or (vol < VOL_MIN or vol > VOL_MAX):
+                vol_fail += 1
                 continue
+
+            ok += 1
 
             rank_bonus = (len(tops) - idx) / max(1, len(tops))
             pb_mid = (PULLBACK_MIN_PCT + PULLBACK_MAX_PCT) / 2.0
@@ -496,14 +516,30 @@ def scan_for_entry_candidate() -> Optional[Tuple[str, int, float, float, float]]
 
             score = 0.55 * rank_bonus + 0.25 * pb_closeness + 0.20 * vol_closeness
 
+            candidates.append((score, sym, tr, pb, vol))
             if best is None or score > best[0]:
                 best = (score, sym, tr, pb, vol)
 
         except Exception:
+            data_fail += 1
             continue
+
+    if DEBUG_SCAN == 1:
+        print(
+            f"SCAN_DEBUG | seen={seen} ok={ok} | "
+            f"trend_fail={trend_fail} data_fail={data_fail} "
+            f"pullback_fail={pullback_fail} reversal_fail={reversal_fail} vol_fail={vol_fail}"
+        )
+        if candidates:
+            candidates.sort(reverse=True, key=lambda x: x[0])
+            print("SCAN_DEBUG_TOP:")
+            for sc, sym, tr, pb, vol in candidates[:max(1, DEBUG_TOPK)]:
+                side_txt = "LONG" if tr > 0 else "SHORT"
+                print(f"  - {sym} {side_txt} | score={sc:.3f} pb={pb*100:.2f}% vol={vol:.5f}")
 
     if best is None:
         return None
+
     return best[1], best[2], best[0], best[3], best[4]
 
 # =========================================================
@@ -513,17 +549,17 @@ def main():
     sync_time()
     st = load_state()
 
-    print("✅ DCA SCALP Bot — AUTO SYMBOL + AUTO SIDE (Trend/Pullback/Reversal SIMPLE) + PnL Exit + Exposure Guard")
-    print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
+    print("✅ DCA SCALP Bot — AUTO SYMBOL + AUTO SIDE + PnL Exit + Exposure Guard + CROSSED-POSITION GUARD")
+    print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE(FORCED)={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe={UNIVERSE_QUOTE} TOP_N_COINS={TOP_N_COINS} | TREND={TREND_INTERVAL} EMA{TREND_EMA} | ENTRY={ENTRY_INTERVAL} EMA{FAST_EMA}/{SLOW_EMA}")
     print(f"Pullback: lookback={PULLBACK_LOOKBACK_BARS} min={PULLBACK_MIN_PCT*100:.2f}% max={PULLBACK_MAX_PCT*100:.2f}%")
     print(f"Vol: lookbackBars={VOL_LOOKBACK_BARS} min={VOL_MIN} max={VOL_MAX}")
     print(f"DCA: base={DCA_BASE_USD} step={DCA_STEP_PCT*100:.2f}% mult={DCA_MULT} maxLv={DCA_MAX_LEVELS}")
     print(f"PnL Exit: use={USE_PNL_EXIT} TP={TP_PNL_USD} SL={SL_PNL_USD} | Price Exit: use={USE_PRICE_EXIT} TP%={TP_PCT*100:.2f} Stop%={HARD_STOP_PCT*100:.2f} TimeStop={TIME_STOP_MIN}m")
     print(f"Exposure: max={MAX_TOTAL_USD_EXPOSURE} action={EXPOSURE_ACTION} | Cooldown={COOLDOWN_MIN}m Reselect={RESELECT_MIN}m")
-    print(f"LOOKBACK_MINUTES={LOOKBACK_MINUTES} | CHECK_SEC={CHECK_SEC}")
+    print(f"LOOKBACK_MINUTES={LOOKBACK_MINUTES} | CHECK_SEC={CHECK_SEC} | DEBUG_SCAN={DEBUG_SCAN}")
 
-    # recover open position after restart
+    # Recover open position on restart (live)
     if TRADING_ENABLED == 1 and RECOVER_OPEN_POS == 1:
         sym = get_any_open_position_symbol()
         if sym:
@@ -542,28 +578,49 @@ def main():
             st.next_add_price = dca_next_add_price(st.avg_entry_est, st.side, DCA_STEP_PCT, st.level)
             ensure_symbol_settings(sym)
             save_state(st)
-            print(f"⚠️ RECOVERED open position: {sym} amt={amt} pnl={pnl:.2f}")
+            print(f"⚠️ RECOVERED open position: {sym} amt={amt} pnl={pnl:.2f} side={'LONG' if st.side>0 else 'SHORT'}")
 
     while True:
         try:
             now = time.time()
 
-            # cooldown after close
+            # Cooldown after close
             if st.last_close_time and (now - st.last_close_time) < (COOLDOWN_MIN * 60):
                 time.sleep(CHECK_SEC)
                 continue
 
-            # live: trust exchange open status
+            # =========================
+            # LIVE: always trust exchange + crossed guard
+            # =========================
             if TRADING_ENABLED == 1 and st.symbol:
                 amt, pnl = get_position(st.symbol)
-                st.open = (amt != 0.0)
-                if not st.open and st.level > 0:
-                    reset_position_state(st)
-                    st.last_close_time = now
-                    save_state(st)
+
+                if amt != 0.0:
+                    exch_side = +1 if amt > 0 else -1
+
+                    # Crossed/flip guard:
+                    # If state says one direction but exchange is opposite -> close immediately (no flip opens)
+                    if st.side != 0 and exch_side != st.side:
+                        print(f"🛑 CROSSED DETECTED {st.symbol} | stateSide={st.side} exchSide={exch_side} -> FORCE CLOSE")
+                        close_market_reduce_only(st.symbol, amt)
+                        reset_position_state(st)
+                        st.last_close_time = time.time()
+                        save_state(st)
+                        time.sleep(2)
+                        continue
+
+                    st.open = True
+                    st.side = exch_side  # keep aligned with exchange truth
+                else:
+                    # Exchange flat
+                    if st.open:
+                        reset_position_state(st)
+                        st.last_close_time = now
+                        save_state(st)
+                    st.open = False
 
             # =========================
-            # FLAT: scan and enter
+            # FLAT: scan + enter
             # =========================
             if not st.open:
                 if st.last_scan_ts and (now - st.last_scan_ts) < (RESELECT_MIN * 60):
@@ -618,11 +675,21 @@ def main():
             held_min = (now - st.entry_time) / 60.0 if st.entry_time else 0.0
             side_txt = "LONG" if st.side > 0 else "SHORT"
 
-            # live PnL exits
+            # Live PnL exits
             if TRADING_ENABLED == 1 and USE_PNL_EXIT == 1:
                 amt, pnl = get_position(sym)
                 if amt == 0.0:
                     print("⚠️ Exchange flat while state open -> reset")
+                    reset_position_state(st)
+                    st.last_close_time = time.time()
+                    save_state(st)
+                    time.sleep(2)
+                    continue
+
+                exch_side = +1 if amt > 0 else -1
+                if exch_side != st.side:
+                    print(f"🛑 CROSSED DETECTED mid-run {sym} | stateSide={st.side} exchSide={exch_side} -> FORCE CLOSE")
+                    close_market_reduce_only(sym, amt)
                     reset_position_state(st)
                     st.last_close_time = time.time()
                     save_state(st)
@@ -651,7 +718,7 @@ def main():
             else:
                 print(f"POS {sym} {side_txt} | mark={mark:.6f} | lv={st.level}/{DCA_MAX_LEVELS} | estExp={st.total_usd_est:.2f} | nextAdd={st.next_add_price:.6f} | held={held_min:.1f}m")
 
-            # price exits (extra safety)
+            # Price exits
             if USE_PRICE_EXIT == 1 and st.avg_entry_est > 0:
                 tp_px = price_tp(st.avg_entry_est, st.side, TP_PCT)
                 sl_px = price_stop(st.avg_entry_est, st.side, HARD_STOP_PCT)
@@ -712,6 +779,20 @@ def main():
                         print(f"⛔ EXPOSURE LIMIT -> STOP_ADD | est={st.total_usd_est:.2f} + add={usd_add:.2f} > max={MAX_TOTAL_USD_EXPOSURE:.2f}")
                         time.sleep(CHECK_SEC)
                         continue
+
+                # Live extra safety: ensure still same direction
+                if TRADING_ENABLED == 1:
+                    amt, _ = get_position(sym)
+                    if amt != 0.0:
+                        exch_side = +1 if amt > 0 else -1
+                        if exch_side != st.side:
+                            print(f"🛑 CROSSED DETECTED before add {sym} -> FORCE CLOSE")
+                            close_market_reduce_only(sym, amt)
+                            reset_position_state(st)
+                            st.last_close_time = time.time()
+                            save_state(st)
+                            time.sleep(2)
+                            continue
 
                 st.level += 1
                 st.total_usd_est = projected
