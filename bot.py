@@ -30,9 +30,9 @@ MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 # Coin selection == entry opportunity scan
 # =========================================================
 UNIVERSE_QUOTE = os.getenv("UNIVERSE_QUOTE", "USDT").upper()
-TOP_N_COINS = int(os.getenv("TOP_N_COINS", "60"))  # volume-ranked candidates
+TOP_N_COINS = int(os.getenv("TOP_N_COINS", "150"))
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
-RESELECT_MIN = int(os.getenv("RESELECT_MIN", "10"))  # how often re-scan when flat
+RESELECT_MIN = int(os.getenv("RESELECT_MIN", "5"))  # how often re-scan when flat
 
 # Timeframes
 TREND_INTERVAL = os.getenv("TREND_INTERVAL", "15m")  # long-trend TF
@@ -43,19 +43,15 @@ TREND_EMA = int(os.getenv("TREND_EMA", "200"))
 FAST_EMA = int(os.getenv("FAST_EMA", "20"))
 SLOW_EMA = int(os.getenv("SLOW_EMA", "50"))
 
-PULLBACK_LOOKBACK_BARS = int(os.getenv("PULLBACK_LOOKBACK_BARS", "60"))  # entry TF bars
-PULLBACK_MIN_PCT = float(os.getenv("PULLBACK_MIN_PCT", "0.35")) / 100.0
-PULLBACK_MAX_PCT = float(os.getenv("PULLBACK_MAX_PCT", "1.50")) / 100.0
-
-# Reversal confirmation: require a fresh cross in last N bars and then hold
-CROSS_LOOKBACK_BARS = int(os.getenv("CROSS_LOOKBACK_BARS", "8"))        # search recent cross
-REVERSE_CONFIRM_BARS = int(os.getenv("REVERSE_CONFIRM_BARS", "2"))       # after cross, remain in favor
+PULLBACK_LOOKBACK_BARS = int(os.getenv("PULLBACK_LOOKBACK_BARS", "90"))
+PULLBACK_MIN_PCT = float(os.getenv("PULLBACK_MIN_PCT", "0.20")) / 100.0
+PULLBACK_MAX_PCT = float(os.getenv("PULLBACK_MAX_PCT", "2.20")) / 100.0
 
 # Volatility filter (avoid too sleepy / too wild)
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "720"))     # for fetching data
-VOL_LOOKBACK_BARS = int(os.getenv("VOL_LOOKBACK_BARS", "240"))   # entry TF
-VOL_MIN = float(os.getenv("VOL_MIN", "0.0006"))                 # 0.06% stdev
-VOL_MAX = float(os.getenv("VOL_MAX", "0.0040"))                 # 0.40% stdev
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "2880"))     # 2 days
+VOL_LOOKBACK_BARS = int(os.getenv("VOL_LOOKBACK_BARS", "180"))    # 3 hours on 1m
+VOL_MIN = float(os.getenv("VOL_MIN", "0.0004"))
+VOL_MAX = float(os.getenv("VOL_MAX", "0.0060"))
 
 # DCA params (USDT notional per add)
 DCA_BASE_USD = float(os.getenv("DCA_BASE_USD", "50"))
@@ -74,7 +70,7 @@ TP_PCT = float(os.getenv("TP_PCT", "0.45")) / 100.0
 HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "2.00")) / 100.0
 TIME_STOP_MIN = int(os.getenv("TIME_STOP_MIN", "45"))
 
-# Exposure guard (A)
+# Exposure guard
 MAX_TOTAL_USD_EXPOSURE = float(os.getenv("MAX_TOTAL_USD_EXPOSURE", "600"))
 EXPOSURE_ACTION = os.getenv("EXPOSURE_ACTION", "STOP_ADD").upper()  # STOP_ADD or FORCE_CLOSE
 
@@ -89,7 +85,7 @@ DENYLIST = [s.strip().upper() for s in os.getenv("SYMBOL_DENYLIST", "").split(",
 
 # State persistence
 STATE_PATH = os.getenv("STATE_PATH", "dca_state.json")
-RECOVER_OPEN_POS = int(os.getenv("RECOVER_OPEN_POS", "1"))  # if bot restarts with open pos, try to recover
+RECOVER_OPEN_POS = int(os.getenv("RECOVER_OPEN_POS", "1"))
 
 client = Client(API_KEY, API_SECRET)
 
@@ -116,7 +112,6 @@ class DCAState:
     level: int = 0
     next_add_price: float = 0.0
 
-    # approx accounting for decisions
     avg_entry_est: float = 0.0
     pos_qty_est: float = 0.0
     total_usd_est: float = 0.0
@@ -156,7 +151,6 @@ def get_position(symbol: str) -> Tuple[float, float]:
     return float(pos["positionAmt"]), float(pos["unRealizedProfit"])
 
 def get_any_open_position_symbol() -> Optional[str]:
-    # Best-effort: find any non-zero position on futures account
     try:
         positions = client.futures_position_information(recvWindow=RECV_WINDOW)
         for p in positions:
@@ -357,7 +351,7 @@ def reset_position_state(st: DCAState) -> None:
     st.total_usd_est = 0.0
 
 # =========================================================
-# DCA PRICING (decision helpers)
+# DCA PRICING
 # =========================================================
 def dca_next_add_price(avg_entry: float, side: int, step_pct: float, level: int) -> float:
     if avg_entry <= 0:
@@ -388,7 +382,6 @@ def excluded_symbol(sym: str) -> bool:
         return True
     if s in set(DENYLIST):
         return True
-    # avoid stable-ish bases or non-crypto synthetics by keyword
     for kw in EXCLUDE_KEYWORDS:
         kw = kw.strip()
         if not kw:
@@ -417,14 +410,9 @@ def get_top_symbols_by_volume(quote: str, top_n: int) -> List[str]:
     return [s for _, s in cand[:top_n]]
 
 # =========================================================
-# TREND + PULLBACK + REVERSAL (entry opportunity)
+# TREND + PULLBACK + REVERSAL (simplified)
 # =========================================================
 def trend_direction(symbol: str) -> Optional[int]:
-    """
-    +1 uptrend (price > EMA(TREND_EMA) on TREND_INTERVAL)
-    -1 downtrend (price < EMA(TREND_EMA))
-    None unclear
-    """
     closes = fetch_closes(symbol, TREND_INTERVAL, LOOKBACK_MINUTES)
     if len(closes) < max(TREND_EMA + 20, 250):
         return None
@@ -439,73 +427,7 @@ def trend_direction(symbol: str) -> Optional[int]:
         return -1
     return None
 
-def _last_cross_direction(closes: List[float], lookback: int) -> Optional[int]:
-    """
-    Return +1 if fast crossed above slow within lookback bars (and now above),
-    -1 if fast crossed below slow within lookback bars (and now below),
-    None otherwise.
-    """
-    if len(closes) < max(SLOW_EMA + lookback + 5, 200):
-        return None
-
-    # compute fast/slow EMA series over a window (approx, but effective)
-    # We'll build ema stepwise for last window
-    window = closes[-max(SLOW_EMA * 6, 400):]
-
-    def ema_series(vals: List[float], period: int) -> List[float]:
-        if len(vals) < period + 5:
-            return []
-        k = 2.0 / (period + 1.0)
-        e = vals[0]
-        out = [e]
-        for v in vals[1:]:
-            e = v * k + e * (1 - k)
-            out.append(e)
-        return out
-
-    ef = ema_series(window, FAST_EMA)
-    es = ema_series(window, SLOW_EMA)
-    if not ef or not es:
-        return None
-
-    n = min(len(ef), len(es))
-    ef = ef[-n:]
-    es = es[-n:]
-
-    diff = [ef[i] - es[i] for i in range(n)]
-    now = diff[-1]
-    if now == 0:
-        return None
-
-    # Look for a sign change within last `lookback` bars
-    lb = min(lookback, n - 2)
-    crossed = None
-    for i in range(n - lb - 1, n - 1):
-        if diff[i] == 0:
-            continue
-        if (diff[i] < 0 and diff[i + 1] > 0):
-            crossed = +1
-        elif (diff[i] > 0 and diff[i + 1] < 0):
-            crossed = -1
-
-    if crossed is None:
-        return None
-
-    # confirm: last REVERSE_CONFIRM_BARS remain in crossed direction
-    k = min(REVERSE_CONFIRM_BARS, n - 1)
-    tail = diff[-k:]
-    if crossed == +1 and all(x > 0 for x in tail):
-        return +1
-    if crossed == -1 and all(x < 0 for x in tail):
-        return -1
-    return None
-
 def pullback_pct(closes: List[float], trend: int) -> float:
-    """
-    Pullback magnitude within last PULLBACK_LOOKBACK_BARS:
-    uptrend: (recent_high - current) / recent_high
-    downtrend: (current - recent_low) / current
-    """
     if len(closes) < PULLBACK_LOOKBACK_BARS + 5:
         return 0.0
     recent = closes[-PULLBACK_LOOKBACK_BARS:]
@@ -517,19 +439,31 @@ def pullback_pct(closes: List[float], trend: int) -> float:
     else:
         return (px - lo) / px if px > 0 else 0.0
 
+def reversal_ok_simple(entry_closes: List[float], trend: int) -> bool:
+    """
+    Uptrend: EMA20 > EMA50 and price > EMA20
+    Downtrend: EMA20 < EMA50 and price < EMA20
+    """
+    if len(entry_closes) < max(SLOW_EMA + 50, 200):
+        return False
+    w = entry_closes[-max(SLOW_EMA * 6, 300):]
+    ef = ema(w, FAST_EMA)
+    es = ema(w, SLOW_EMA)
+    px = w[-1]
+    if ef <= 0 or es <= 0:
+        return False
+    if trend > 0:
+        return (ef > es) and (px > ef)
+    else:
+        return (ef < es) and (px < ef)
+
 def scan_for_entry_candidate() -> Optional[Tuple[str, int, float, float, float]]:
     """
     Returns: (symbol, side, score, pullback, vol)
-    side = +1 LONG, -1 SHORT
-    Only returns candidates that satisfy:
-      - long TF trend
-      - short TF pullback within [min,max]
-      - recent reversal cross in trend direction
-      - volatility within [VOL_MIN,VOL_MAX] (soft filter; can fallback)
     """
     tops = get_top_symbols_by_volume(UNIVERSE_QUOTE, TOP_N_COINS)
+    best = None  # (score, sym, side, pb, vol)
 
-    best = None  # (score, sym, side, pb, vol, rank_bonus)
     for idx, sym in enumerate(tops):
         try:
             tr = trend_direction(sym)
@@ -544,30 +478,26 @@ def scan_for_entry_candidate() -> Optional[Tuple[str, int, float, float, float]]
             if pb < PULLBACK_MIN_PCT or pb > PULLBACK_MAX_PCT:
                 continue
 
-            # reversal cross in trend direction must exist recently
-            cross_dir = _last_cross_direction(entry_closes, lookback=CROSS_LOOKBACK_BARS)
-            if cross_dir is None or cross_dir != tr:
+            if not reversal_ok_simple(entry_closes, tr):
                 continue
 
             vol = stdev_returns(entry_closes, VOL_LOOKBACK_BARS)
-            vol_ok = (vol >= VOL_MIN and vol <= VOL_MAX) if vol > 0 else False
-            if not vol_ok:
-                # skip extreme cases; keep a soft path only if data missing
+            if vol > 0:
+                if vol < VOL_MIN or vol > VOL_MAX:
+                    continue
+            else:
                 continue
 
-            # score: prefer top volume ranks + "ideal" pullback mid + vol mid
             rank_bonus = (len(tops) - idx) / max(1, len(tops))
-
             pb_mid = (PULLBACK_MIN_PCT + PULLBACK_MAX_PCT) / 2.0
             pb_closeness = 1.0 - min(1.0, abs(pb - pb_mid) / (pb_mid if pb_mid > 0 else 1.0))
-
             vol_mid = (VOL_MIN + VOL_MAX) / 2.0
             vol_closeness = 1.0 - min(1.0, abs(vol - vol_mid) / (vol_mid if vol_mid > 0 else 1.0))
 
             score = 0.55 * rank_bonus + 0.25 * pb_closeness + 0.20 * vol_closeness
 
             if best is None or score > best[0]:
-                best = (score, sym, tr, pb, vol, rank_bonus)
+                best = (score, sym, tr, pb, vol)
 
         except Exception:
             continue
@@ -577,22 +507,23 @@ def scan_for_entry_candidate() -> Optional[Tuple[str, int, float, float, float]]
     return best[1], best[2], best[0], best[3], best[4]
 
 # =========================================================
-# MAIN LOOP
+# MAIN
 # =========================================================
 def main():
     sync_time()
     st = load_state()
 
-    print("✅ DCA SCALP Bot — AUTO SYMBOL + AUTO SIDE (Trend/Pullback/Reversal) + PnL Exit + Exposure Guard")
+    print("✅ DCA SCALP Bot — AUTO SYMBOL + AUTO SIDE (Trend/Pullback/Reversal SIMPLE) + PnL Exit + Exposure Guard")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
     print(f"Universe={UNIVERSE_QUOTE} TOP_N_COINS={TOP_N_COINS} | TREND={TREND_INTERVAL} EMA{TREND_EMA} | ENTRY={ENTRY_INTERVAL} EMA{FAST_EMA}/{SLOW_EMA}")
-    print(f"Pullback: lookback={PULLBACK_LOOKBACK_BARS} min={PULLBACK_MIN_PCT*100:.2f}% max={PULLBACK_MAX_PCT*100:.2f}% | Cross lookback={CROSS_LOOKBACK_BARS} confirm={REVERSE_CONFIRM_BARS}")
+    print(f"Pullback: lookback={PULLBACK_LOOKBACK_BARS} min={PULLBACK_MIN_PCT*100:.2f}% max={PULLBACK_MAX_PCT*100:.2f}%")
+    print(f"Vol: lookbackBars={VOL_LOOKBACK_BARS} min={VOL_MIN} max={VOL_MAX}")
     print(f"DCA: base={DCA_BASE_USD} step={DCA_STEP_PCT*100:.2f}% mult={DCA_MULT} maxLv={DCA_MAX_LEVELS}")
     print(f"PnL Exit: use={USE_PNL_EXIT} TP={TP_PNL_USD} SL={SL_PNL_USD} | Price Exit: use={USE_PRICE_EXIT} TP%={TP_PCT*100:.2f} Stop%={HARD_STOP_PCT*100:.2f} TimeStop={TIME_STOP_MIN}m")
     print(f"Exposure: max={MAX_TOTAL_USD_EXPOSURE} action={EXPOSURE_ACTION} | Cooldown={COOLDOWN_MIN}m Reselect={RESELECT_MIN}m")
-    print(f"Vol: lookbackBars={VOL_LOOKBACK_BARS} min={VOL_MIN} max={VOL_MAX} | CHECK_SEC={CHECK_SEC}")
+    print(f"LOOKBACK_MINUTES={LOOKBACK_MINUTES} | CHECK_SEC={CHECK_SEC}")
 
-    # recover if bot restarts with an open position
+    # recover open position after restart
     if TRADING_ENABLED == 1 and RECOVER_OPEN_POS == 1:
         sym = get_any_open_position_symbol()
         if sym:
@@ -605,14 +536,13 @@ def main():
             if st.level == 0:
                 st.level = 1
             if st.total_usd_est == 0.0:
-                # unknown; set to base as conservative
                 st.total_usd_est = DCA_BASE_USD
             if st.avg_entry_est == 0.0:
                 st.avg_entry_est = get_mark(sym)
             st.next_add_price = dca_next_add_price(st.avg_entry_est, st.side, DCA_STEP_PCT, st.level)
             ensure_symbol_settings(sym)
             save_state(st)
-            print(f"⚠️ RECOVERED open position: {sym} amt={amt} pnl={pnl:.2f} inferredSide={'LONG' if st.side>0 else 'SHORT'}")
+            print(f"⚠️ RECOVERED open position: {sym} amt={amt} pnl={pnl:.2f}")
 
     while True:
         try:
@@ -623,21 +553,19 @@ def main():
                 time.sleep(CHECK_SEC)
                 continue
 
-            # if live, trust exchange open status
+            # live: trust exchange open status
             if TRADING_ENABLED == 1 and st.symbol:
                 amt, pnl = get_position(st.symbol)
                 st.open = (amt != 0.0)
-                # if exchange says flat but state open, reset
                 if not st.open and st.level > 0:
                     reset_position_state(st)
                     st.last_close_time = now
                     save_state(st)
 
-            # ==========================================
-            # FLAT: scan and enter (coin selection == entry opportunity)
-            # ==========================================
+            # =========================
+            # FLAT: scan and enter
+            # =========================
             if not st.open:
-                # throttle scanning
                 if st.last_scan_ts and (now - st.last_scan_ts) < (RESELECT_MIN * 60):
                     time.sleep(CHECK_SEC)
                     continue
@@ -658,7 +586,6 @@ def main():
                 side_txt = "LONG" if side > 0 else "SHORT"
                 mark = get_mark(sym)
 
-                # initialize DCA state
                 st.open = True
                 st.entry_time = now
                 st.level = 1
@@ -677,12 +604,11 @@ def main():
                 time.sleep(1)
                 continue
 
-            # ==========================================
-            # OPEN: manage position (PnL exits + price safety + DCA adds)
-            # ==========================================
+            # =========================
+            # OPEN: manage
+            # =========================
             sym = st.symbol
             if not sym:
-                # shouldn't happen, but keep safe
                 reset_position_state(st)
                 save_state(st)
                 time.sleep(CHECK_SEC)
@@ -692,13 +618,11 @@ def main():
             held_min = (now - st.entry_time) / 60.0 if st.entry_time else 0.0
             side_txt = "LONG" if st.side > 0 else "SHORT"
 
-            # Live PnL exits (primary)
+            # live PnL exits
             if TRADING_ENABLED == 1 and USE_PNL_EXIT == 1:
                 amt, pnl = get_position(sym)
-
-                # one-leg safety (shouldn't happen for single symbol)
                 if amt == 0.0:
-                    print("⚠️ Exchange shows flat while state open -> reset")
+                    print("⚠️ Exchange flat while state open -> reset")
                     reset_position_state(st)
                     st.last_close_time = time.time()
                     save_state(st)
@@ -724,12 +648,10 @@ def main():
                     save_state(st)
                     time.sleep(2)
                     continue
-
             else:
-                # DRY or no-PnL mode: show status
                 print(f"POS {sym} {side_txt} | mark={mark:.6f} | lv={st.level}/{DCA_MAX_LEVELS} | estExp={st.total_usd_est:.2f} | nextAdd={st.next_add_price:.6f} | held={held_min:.1f}m")
 
-            # Optional price-based safety exits (works in DRY, can remain as extra safety in live)
+            # price exits (extra safety)
             if USE_PRICE_EXIT == 1 and st.avg_entry_est > 0:
                 tp_px = price_tp(st.avg_entry_est, st.side, TP_PCT)
                 sl_px = price_stop(st.avg_entry_est, st.side, HARD_STOP_PCT)
@@ -767,12 +689,12 @@ def main():
                 time.sleep(2)
                 continue
 
-            # DCA add logic
+            # DCA add
             can_add = (st.level < DCA_MAX_LEVELS)
             hit_add = (st.side > 0 and mark <= st.next_add_price) or (st.side < 0 and mark >= st.next_add_price)
 
             if can_add and hit_add:
-                usd_add = DCA_BASE_USD * (DCA_MULT ** (st.level - 1))  # level=1 already used for initial
+                usd_add = DCA_BASE_USD * (DCA_MULT ** (st.level - 1))
                 projected = st.total_usd_est + usd_add
 
                 if projected > MAX_TOTAL_USD_EXPOSURE:
@@ -791,11 +713,9 @@ def main():
                         time.sleep(CHECK_SEC)
                         continue
 
-                # proceed with add
                 st.level += 1
                 st.total_usd_est = projected
 
-                # update avg estimate for decision logic
                 add_qty = (usd_add / mark) if mark > 0 else 0.0
                 total_cost = st.avg_entry_est * st.pos_qty_est + mark * add_qty
                 st.pos_qty_est += add_qty
