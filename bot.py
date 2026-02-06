@@ -930,6 +930,10 @@ def main():
 
                 amt, pnl, entry_px = get_position_cached(sym)
 
+                if TRADING_ENABLED == 1 and amt == 0.0:
+                    to_close.append((sym, "EXCHANGE_FLAT"))
+                    continue
+    
                 held_min = (now - ts.entry_time) / 60.0 if ts.entry_time else 0.0
                 side_txt = "LONG" if ts.side > 0 else "SHORT"
 
