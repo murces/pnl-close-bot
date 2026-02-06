@@ -22,6 +22,7 @@ CHECK_SEC = int(os.getenv("CHECK_SEC", "5"))
 
 # Forced one-way mode
 HEDGE_MODE = 0  # DO NOT CHANGE
+
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 
@@ -32,7 +33,13 @@ client = Client(API_KEY, API_SECRET)
 # =========================================================
 UNIVERSE_QUOTE = os.getenv("UNIVERSE_QUOTE", "USDT").upper()
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "150"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "5"))
+
+# Side-based caps (NEW)
+MAX_OPEN_LONG = int(os.getenv("MAX_OPEN_LONG", "3"))
+MAX_OPEN_SHORT = int(os.getenv("MAX_OPEN_SHORT", "3"))
+
+# Optional global cap (if not set, defaults to long+short)
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", str(MAX_OPEN_LONG + MAX_OPEN_SHORT)))
 
 # Cooldown only for closed symbol
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
@@ -49,7 +56,8 @@ TREND_EMA = int(os.getenv("TREND_EMA", "200"))
 FAST_EMA = int(os.getenv("FAST_EMA", "20"))
 SLOW_EMA = int(os.getenv("SLOW_EMA", "50"))
 
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "12000"))  # big enough for EMA200 on 15m
+# Lookback large enough for EMA200 on 15m (>= 3750 min for 250 bars)
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "12000"))
 
 # Pullback
 PULLBACK_LOOKBACK_BARS = int(os.getenv("PULLBACK_LOOKBACK_BARS", "90"))
@@ -439,16 +447,32 @@ def load_state() -> PortfolioState:
         return PortfolioState(trades={}, cooldowns={}, last_scan_ts=0.0)
 
 # =========================================================
-# SCAN: return top candidates (not just one)
+# COUNTERS
 # =========================================================
-def scan_candidates(ps: PortfolioState, need_slots: int) -> List[Tuple[float, str, int, float, float]]:
+def count_sides(ps: PortfolioState) -> Tuple[int, int]:
+    longs = sum(1 for t in ps.trades.values() if t.open and t.side > 0)
+    shorts = sum(1 for t in ps.trades.values() if t.open and t.side < 0)
+    return longs, shorts
+
+def portfolio_est_exposure(ps: PortfolioState) -> float:
+    return sum(t.usd_est for t in ps.trades.values() if t.open)
+
+# =========================================================
+# SCAN: return top candidates (side-filtered)
+# =========================================================
+def scan_candidates(ps: PortfolioState, need_slots: int, side_filter: Optional[int] = None) -> List[Tuple[float, str, int, float, float]]:
     """
-    Returns list of candidates sorted by score desc:
+    Returns candidates sorted by score desc:
       (score, symbol, side(+1/-1), pullback, vol)
+
     Skips:
       - already open trades
       - cooldown symbols
+      - if side_filter set, only that direction is allowed
     """
+    if need_slots <= 0:
+        return []
+
     now = time.time()
     tops = get_top_symbols_by_volume(UNIVERSE_QUOTE, TOP_N_COINS)
 
@@ -460,6 +484,7 @@ def scan_candidates(ps: PortfolioState, need_slots: int) -> List[Tuple[float, st
     vol_fail = 0
     skipped_open = 0
     skipped_cd = 0
+    skipped_side = 0
     ok = 0
 
     candidates: List[Tuple[float, str, int, float, float]] = []
@@ -482,6 +507,10 @@ def scan_candidates(ps: PortfolioState, need_slots: int) -> List[Tuple[float, st
             tr = trend_direction(sym)
             if tr is None:
                 trend_fail += 1
+                continue
+
+            if side_filter is not None and tr != side_filter:
+                skipped_side += 1
                 continue
 
             entry_closes = fetch_closes(sym, ENTRY_INTERVAL, LOOKBACK_MINUTES)
@@ -522,25 +551,20 @@ def scan_candidates(ps: PortfolioState, need_slots: int) -> List[Tuple[float, st
     candidates.sort(reverse=True, key=lambda x: x[0])
 
     if DEBUG_SCAN == 1:
+        sf = "ANY" if side_filter is None else ("LONG" if side_filter > 0 else "SHORT")
         print(
-            f"SCAN_DEBUG | seen={seen} ok={ok} needSlots={need_slots} | "
-            f"skip_open={skipped_open} skip_cd={skipped_cd} | "
+            f"SCAN_DEBUG({sf}) | seen={seen} ok={ok} needSlots={need_slots} | "
+            f"skip_open={skipped_open} skip_cd={skipped_cd} skip_side={skipped_side} | "
             f"trend_fail={trend_fail} data_fail={data_fail} pullback_fail={pullback_fail} "
             f"reversal_fail={reversal_fail} vol_fail={vol_fail}"
         )
         if candidates:
-            print("SCAN_DEBUG_TOP:")
+            print(f"SCAN_DEBUG_TOP({sf}):")
             for sc, sym, tr, pb, vol in candidates[:max(1, DEBUG_TOPK)]:
                 side_txt = "LONG" if tr > 0 else "SHORT"
                 print(f"  - {sym} {side_txt} | score={sc:.3f} pb={pb*100:.2f}% vol={vol:.5f}")
 
-    return candidates[:max(0, need_slots)]
-
-# =========================================================
-# GLOBAL EXPOSURE (estimate only, for guard)
-# =========================================================
-def portfolio_est_exposure(ps: PortfolioState) -> float:
-    return sum(t.usd_est for t in ps.trades.values() if t.open)
+    return candidates[:need_slots]
 
 # =========================================================
 # RECOVER OPEN POSITIONS (LIVE)
@@ -558,8 +582,19 @@ def recover_live_positions(ps: PortfolioState) -> None:
             if amt == 0.0:
                 continue
             side = +1 if amt > 0 else -1
+
+            # respect caps on recovery (optional behavior)
+            longs_open, shorts_open = count_sides(ps)
+            if side > 0 and longs_open >= MAX_OPEN_LONG:
+                continue
+            if side < 0 and shorts_open >= MAX_OPEN_SHORT:
+                continue
+            if len(ps.trades) >= MAX_OPEN_TRADES:
+                continue
+
             if sym in ps.trades:
                 continue
+
             mark = get_mark(sym)
             ensure_symbol_settings(sym)
             ts = TradeState(
@@ -614,6 +649,48 @@ def force_close_if_crossed(ps: PortfolioState, sym: str, expected_side: int) -> 
     return False
 
 # =========================================================
+# SLOT ALLOCATION (NEW)
+# =========================================================
+def compute_side_slots(ps: PortfolioState) -> Tuple[int, int]:
+    """
+    Returns (slots_long, slots_short) after applying:
+      - side caps (MAX_OPEN_LONG / MAX_OPEN_SHORT)
+      - optional global cap (MAX_OPEN_TRADES)
+    Priority: fill the side that has MORE available slots first (more "missing").
+    """
+    longs_open, shorts_open = count_sides(ps)
+
+    raw_long = max(0, MAX_OPEN_LONG - longs_open)
+    raw_short = max(0, MAX_OPEN_SHORT - shorts_open)
+
+    total_slots = max(0, MAX_OPEN_TRADES - len(ps.trades))
+    if total_slots <= 0:
+        return 0, 0
+
+    # choose which side to fill first: the one with more remaining capacity
+    first = "LONG" if raw_long >= raw_short else "SHORT"
+
+    alloc_long = 0
+    alloc_short = 0
+    for _ in range(total_slots):
+        if first == "LONG":
+            if alloc_long < raw_long:
+                alloc_long += 1
+            elif alloc_short < raw_short:
+                alloc_short += 1
+            else:
+                break
+        else:
+            if alloc_short < raw_short:
+                alloc_short += 1
+            elif alloc_long < raw_long:
+                alloc_long += 1
+            else:
+                break
+
+    return alloc_long, alloc_short
+
+# =========================================================
 # MAIN
 # =========================================================
 def main():
@@ -624,9 +701,10 @@ def main():
     if ps.cooldowns is None:
         ps.cooldowns = {}
 
-    print("✅ DCA SCALP Bot — MULTI-TRADE + AUTO SYMBOL + AUTO SIDE + Per-Symbol Cooldown + MAX_OPEN_TRADES")
+    print("✅ DCA SCALP Bot — MULTI-TRADE + AUTO SYMBOL + AUTO SIDE + Per-Symbol Cooldown + SIDE CAPS (LONG/SHORT)")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE(FORCED)={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
-    print(f"Universe={UNIVERSE_QUOTE} TOP_N_COINS={TOP_N_COINS} | MAX_OPEN_TRADES={MAX_OPEN_TRADES}")
+    print(f"Universe={UNIVERSE_QUOTE} TOP_N_COINS={TOP_N_COINS}")
+    print(f"Caps: MAX_OPEN_LONG={MAX_OPEN_LONG} | MAX_OPEN_SHORT={MAX_OPEN_SHORT} | MAX_OPEN_TRADES={MAX_OPEN_TRADES}")
     print(f"TREND={TREND_INTERVAL} EMA{TREND_EMA} | ENTRY={ENTRY_INTERVAL} EMA{FAST_EMA}/{SLOW_EMA} | LOOKBACK_MINUTES={LOOKBACK_MINUTES}")
     print(f"Pullback: lookback={PULLBACK_LOOKBACK_BARS} min={PULLBACK_MIN_PCT*100:.2f}% max={PULLBACK_MAX_PCT*100:.2f}%")
     print(f"Vol: lookbackBars={VOL_LOOKBACK_BARS} min={VOL_MIN} max={VOL_MAX}")
@@ -649,7 +727,12 @@ def main():
             if DEBUG_EVERY_SEC > 0 and now - last_heartbeat >= DEBUG_EVERY_SEC:
                 last_heartbeat = now
                 active_cd = sum(1 for _, t in ps.cooldowns.items() if now < float(t))
-                print(f"HEARTBEAT | openTrades={len(ps.trades)}/{MAX_OPEN_TRADES} | cooldownActive={active_cd} | estExposure={portfolio_est_exposure(ps):.2f}")
+                longs_open, shorts_open = count_sides(ps)
+                print(
+                    f"HEARTBEAT | openTrades={len(ps.trades)}/{MAX_OPEN_TRADES} "
+                    f"| L={longs_open}/{MAX_OPEN_LONG} S={shorts_open}/{MAX_OPEN_SHORT} "
+                    f"| cooldownActive={active_cd} | estExposure={portfolio_est_exposure(ps):.2f}"
+                )
 
             # =========================
             # 1) MANAGE ALL OPEN TRADES
@@ -742,19 +825,26 @@ def main():
                 close_trade(ps, sym, reason)
 
             # =========================
-            # 2) FILL EMPTY SLOTS (SCAN & OPEN)
+            # 2) FILL EMPTY SLOTS (SIDE-BASED)
             # =========================
-            open_count = len(ps.trades)
-            slots = max(0, MAX_OPEN_TRADES - open_count)
+            slots_long, slots_short = compute_side_slots(ps)
+            total_slots = slots_long + slots_short
 
-            if slots > 0:
+            if total_slots > 0:
                 if ps.last_scan_ts and (now - ps.last_scan_ts) < (RESELECT_MIN * 60):
                     save_state(ps)
                     time.sleep(CHECK_SEC)
                     continue
 
                 ps.last_scan_ts = now
-                cands = scan_candidates(ps, need_slots=slots)
+
+                cands: List[Tuple[float, str, int, float, float]] = []
+                if slots_long > 0:
+                    cands += scan_candidates(ps, need_slots=slots_long, side_filter=+1)
+                if slots_short > 0:
+                    cands += scan_candidates(ps, need_slots=slots_short, side_filter=-1)
+
+                cands.sort(reverse=True, key=lambda x: x[0])
 
                 if not cands:
                     print("SCAN: no entry candidates now.")
@@ -762,6 +852,12 @@ def main():
                     for score, sym, side, pb, vol in cands:
                         if len(ps.trades) >= MAX_OPEN_TRADES:
                             break
+
+                        longs_open, shorts_open = count_sides(ps)
+                        if side > 0 and longs_open >= MAX_OPEN_LONG:
+                            continue
+                        if side < 0 and shorts_open >= MAX_OPEN_SHORT:
+                            continue
 
                         # re-check cooldown & open set (race safety)
                         if sym in ps.trades:
