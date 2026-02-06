@@ -3,7 +3,7 @@ import time
 import math
 import json
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 
 from binance.client import Client
@@ -19,37 +19,44 @@ if not API_KEY or not API_SECRET:
 TRADING_ENABLED = int(os.getenv("TRADING_ENABLED", "0"))  # 0=dry-run, 1=live
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "60000"))
 CHECK_SEC = int(os.getenv("CHECK_SEC", "5"))
-DEBUG_SCAN = int(os.getenv("DEBUG_SCAN", "0"))
-DEBUG_TOPK = int(os.getenv("DEBUG_TOPK", "5"))
 
-# Futures settings (FORCED)
-HEDGE_MODE = 0  # <- FORCED one-way mode (no hedge)
+# Forced one-way mode
+HEDGE_MODE = 0  # DO NOT CHANGE
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED").upper()
 
+client = Client(API_KEY, API_SECRET)
+
 # =========================================================
-# STRATEGY: DCA SCALP (ONLY) + AUTO SYMBOL + AUTO SIDE
+# STRATEGY / PORTFOLIO
 # =========================================================
 UNIVERSE_QUOTE = os.getenv("UNIVERSE_QUOTE", "USDT").upper()
 TOP_N_COINS = int(os.getenv("TOP_N_COINS", "150"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "5"))
+
+# Cooldown only for closed symbol
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "10"))
-RESELECT_MIN = int(os.getenv("RESELECT_MIN", "5"))  # re-scan frequency when flat
+
+# How often to rescan (when we still have capacity)
+RESELECT_MIN = int(os.getenv("RESELECT_MIN", "1"))
 
 # Timeframes
 TREND_INTERVAL = os.getenv("TREND_INTERVAL", "15m")
 ENTRY_INTERVAL = os.getenv("ENTRY_INTERVAL", "1m")
 
-# Trend / pullback / reversal
+# Trend / entry
 TREND_EMA = int(os.getenv("TREND_EMA", "200"))
 FAST_EMA = int(os.getenv("FAST_EMA", "20"))
 SLOW_EMA = int(os.getenv("SLOW_EMA", "50"))
 
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "12000"))  # big enough for EMA200 on 15m
+
+# Pullback
 PULLBACK_LOOKBACK_BARS = int(os.getenv("PULLBACK_LOOKBACK_BARS", "90"))
 PULLBACK_MIN_PCT = float(os.getenv("PULLBACK_MIN_PCT", "0.20")) / 100.0
 PULLBACK_MAX_PCT = float(os.getenv("PULLBACK_MAX_PCT", "2.20")) / 100.0
 
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "2880"))  # 2 days
-
+# Vol filter
 VOL_LOOKBACK_BARS = int(os.getenv("VOL_LOOKBACK_BARS", "180"))
 VOL_MIN = float(os.getenv("VOL_MIN", "0.0004"))
 VOL_MAX = float(os.getenv("VOL_MAX", "0.0060"))
@@ -61,7 +68,7 @@ DCA_MULT = float(os.getenv("DCA_MULT", "1.5"))
 DCA_MAX_LEVELS = int(os.getenv("DCA_MAX_LEVELS", "5"))
 
 # Exits
-USE_PNL_EXIT = int(os.getenv("USE_PNL_EXIT", "1"))  # (live)
+USE_PNL_EXIT = int(os.getenv("USE_PNL_EXIT", "1"))
 TP_PNL_USD = float(os.getenv("TP_PNL_USD", "8"))
 SL_PNL_USD = float(os.getenv("SL_PNL_USD", "-25"))
 
@@ -70,24 +77,27 @@ TP_PCT = float(os.getenv("TP_PCT", "0.45")) / 100.0
 HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "2.00")) / 100.0
 TIME_STOP_MIN = int(os.getenv("TIME_STOP_MIN", "45"))
 
-# Exposure guard
-MAX_TOTAL_USD_EXPOSURE = float(os.getenv("MAX_TOTAL_USD_EXPOSURE", "600"))
+# Exposure (per trade and global)
+MAX_USD_PER_TRADE = float(os.getenv("MAX_USD_PER_TRADE", "600"))
+MAX_TOTAL_USD_EXPOSURE = float(os.getenv("MAX_TOTAL_USD_EXPOSURE", "2500"))
 EXPOSURE_ACTION = os.getenv("EXPOSURE_ACTION", "STOP_ADD").upper()  # STOP_ADD or FORCE_CLOSE
 
-# Symbol filters
+# Filters
 EXCLUDE_KEYWORDS = os.getenv(
     "EXCLUDE_KEYWORDS",
     "BUSD,USDC,TUSD,FDUSD,DAI,PAX,EUR,GBP,TRY"
 ).upper().split(",")
-
 ALLOWLIST = [s.strip().upper() for s in os.getenv("SYMBOL_ALLOWLIST", "").split(",") if s.strip()]
 DENYLIST = [s.strip().upper() for s in os.getenv("SYMBOL_DENYLIST", "").split(",") if s.strip()]
 
-# State persistence
-STATE_PATH = os.getenv("STATE_PATH", "dca_state.json")
-RECOVER_OPEN_POS = int(os.getenv("RECOVER_OPEN_POS", "1"))
+# Debug
+DEBUG_SCAN = int(os.getenv("DEBUG_SCAN", "0"))
+DEBUG_TOPK = int(os.getenv("DEBUG_TOPK", "5"))
+DEBUG_EVERY_SEC = int(os.getenv("DEBUG_EVERY_SEC", "30"))
 
-client = Client(API_KEY, API_SECRET)
+# State
+STATE_PATH = os.getenv("STATE_PATH", "dca_portfolio_state.json")
+RECOVER_OPEN_POS = int(os.getenv("RECOVER_OPEN_POS", "1"))
 
 # =========================================================
 # CACHES
@@ -97,24 +107,27 @@ _LOT_CACHE: Dict[str, Tuple[float, float]] = {}
 _KLINE_CACHE: Dict[Tuple[str, str, int], Tuple[int, List[float]]] = {}
 
 # =========================================================
-# DATA
+# DATA STRUCTURES
 # =========================================================
 @dataclass
-class DCAState:
-    symbol: str = ""
-    side: int = 0  # +1 long, -1 short
-    open: bool = False
-
+class TradeState:
+    symbol: str
+    side: int  # +1 long, -1 short
+    open: bool = True
     entry_time: float = 0.0
-    last_close_time: float = 0.0
-    last_scan_ts: float = 0.0
-
-    level: int = 0
+    level: int = 1
     next_add_price: float = 0.0
 
+    # Estimated tracking (DRY / convenience)
     avg_entry_est: float = 0.0
     pos_qty_est: float = 0.0
-    total_usd_est: float = 0.0
+    usd_est: float = 0.0
+
+@dataclass
+class PortfolioState:
+    trades: Dict[str, TradeState]  # key=symbol
+    cooldowns: Dict[str, float]    # symbol -> cooldown_until_ts
+    last_scan_ts: float = 0.0
 
 # =========================================================
 # BINANCE HELPERS
@@ -149,18 +162,6 @@ def get_position(symbol: str) -> Tuple[float, float]:
     data = client.futures_position_information(symbol=symbol, recvWindow=RECV_WINDOW)
     pos = data[0]
     return float(pos["positionAmt"]), float(pos["unRealizedProfit"])
-
-def get_any_open_position_symbol() -> Optional[str]:
-    try:
-        positions = client.futures_position_information(recvWindow=RECV_WINDOW)
-        for p in positions:
-            amt = float(p.get("positionAmt", "0") or 0.0)
-            sym = p.get("symbol", "")
-            if amt != 0.0 and sym and sym.endswith(UNIVERSE_QUOTE):
-                return sym
-    except Exception:
-        return None
-    return None
 
 def get_step_min(symbol: str) -> Tuple[float, float]:
     if symbol not in _LOT_CACHE:
@@ -212,7 +213,6 @@ def open_market(symbol: str, direction: int, usd: float) -> None:
     if TRADING_ENABLED == 0:
         return
 
-    # Crossed-position guard (exchange truth)
     amt, _ = get_position(symbol)
     if amt != 0.0:
         existing_dir = 1 if amt > 0 else -1
@@ -225,9 +225,9 @@ def open_market(symbol: str, direction: int, usd: float) -> None:
         raise RuntimeError(f"[{symbol}] qty too small for usd={usd}")
 
     side = "BUY" if direction > 0 else "SELL"
-    params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, recvWindow=RECV_WINDOW)
-    # HEDGE_MODE forced off: no positionSide
-    client.futures_create_order(**params)
+    client.futures_create_order(
+        symbol=symbol, side=side, type="MARKET", quantity=qty, recvWindow=RECV_WINDOW
+    )
 
 def close_market_reduce_only(symbol: str, position_amt: float) -> None:
     if TRADING_ENABLED == 0:
@@ -238,8 +238,9 @@ def close_market_reduce_only(symbol: str, position_amt: float) -> None:
     qty = floor_to_step(symbol, abs(position_amt))
     if qty <= 0:
         return
-    params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, reduceOnly=True, recvWindow=RECV_WINDOW)
-    client.futures_create_order(**params)
+    client.futures_create_order(
+        symbol=symbol, side=side, type="MARKET", quantity=qty, reduceOnly=True, recvWindow=RECV_WINDOW
+    )
 
 # =========================================================
 # DATA / STATS
@@ -300,67 +301,10 @@ def stdev_returns(closes: List[float], lookback: int) -> float:
     if len(r) < 30:
         return 0.0
     s = statistics.pstdev(r)
-    if not math.isfinite(s):
-        return 0.0
-    return s
+    return s if math.isfinite(s) else 0.0
 
 # =========================================================
-# STATE
-# =========================================================
-def save_state(st: DCAState) -> None:
-    try:
-        data = {
-            "symbol": st.symbol,
-            "side": st.side,
-            "open": st.open,
-            "entry_time": st.entry_time,
-            "last_close_time": st.last_close_time,
-            "last_scan_ts": st.last_scan_ts,
-            "level": st.level,
-            "next_add_price": st.next_add_price,
-            "avg_entry_est": st.avg_entry_est,
-            "pos_qty_est": st.pos_qty_est,
-            "total_usd_est": st.total_usd_est,
-        }
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception as e:
-        print(f"⚠️ state save failed: {e}")
-
-def load_state() -> DCAState:
-    try:
-        if not os.path.exists(STATE_PATH):
-            return DCAState()
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        st = DCAState()
-        st.symbol = str(data.get("symbol", "")).upper()
-        st.side = int(data.get("side", 0))
-        st.open = bool(data.get("open", False))
-        st.entry_time = float(data.get("entry_time", 0.0))
-        st.last_close_time = float(data.get("last_close_time", 0.0))
-        st.last_scan_ts = float(data.get("last_scan_ts", 0.0))
-        st.level = int(data.get("level", 0))
-        st.next_add_price = float(data.get("next_add_price", 0.0))
-        st.avg_entry_est = float(data.get("avg_entry_est", 0.0))
-        st.pos_qty_est = float(data.get("pos_qty_est", 0.0))
-        st.total_usd_est = float(data.get("total_usd_est", 0.0))
-        return st
-    except Exception as e:
-        print(f"⚠️ state load failed: {e}")
-        return DCAState()
-
-def reset_position_state(st: DCAState) -> None:
-    st.open = False
-    st.entry_time = 0.0
-    st.level = 0
-    st.next_add_price = 0.0
-    st.avg_entry_est = 0.0
-    st.pos_qty_est = 0.0
-    st.total_usd_est = 0.0
-
-# =========================================================
-# DCA PRICING
+# PRICE HELPERS
 # =========================================================
 def dca_next_add_price(avg_entry: float, side: int, step_pct: float, level: int) -> float:
     if avg_entry <= 0:
@@ -381,7 +325,7 @@ def price_stop(avg_entry: float, side: int, stop_pct: float) -> float:
     return avg_entry * (1.0 - stop_pct) if side > 0 else avg_entry * (1.0 + stop_pct)
 
 # =========================================================
-# SYMBOL FILTERS / CANDIDATES
+# FILTERS / UNIVERSE
 # =========================================================
 def excluded_symbol(sym: str) -> bool:
     s = sym.upper()
@@ -419,22 +363,19 @@ def get_top_symbols_by_volume(quote: str, top_n: int) -> List[str]:
     return [s for _, s in cand[:top_n]]
 
 # =========================================================
-# TREND + PULLBACK + REVERSAL (simple)
+# SIGNAL: trend + pullback + reversal + vol
 # =========================================================
 def trend_direction(symbol: str) -> Optional[int]:
     closes = fetch_closes(symbol, TREND_INTERVAL, LOOKBACK_MINUTES)
-    if len(closes) < max(TREND_EMA + 20, 250):
+    need = max(TREND_EMA + 20, 250)
+    if len(closes) < need:
         return None
     w = closes[-max(TREND_EMA * 3, 450):]
     et = ema(w, TREND_EMA)
     px = w[-1]
     if et <= 0:
         return None
-    if px > et:
-        return +1
-    if px < et:
-        return -1
-    return None
+    return +1 if px > et else (-1 if px < et else None)
 
 def pullback_pct(closes: List[float], trend: int) -> float:
     if len(closes) < PULLBACK_LOOKBACK_BARS + 5:
@@ -463,9 +404,52 @@ def reversal_ok_simple(entry_closes: List[float], trend: int) -> bool:
         return (ef < es) and (px < ef)
 
 # =========================================================
-# SCAN (with optional debug)
+# PORTFOLIO STATE I/O
 # =========================================================
-def scan_for_entry_candidate() -> Optional[Tuple[str, int, float, float, float]]:
+def save_state(ps: PortfolioState) -> None:
+    try:
+        out = {
+            "trades": {k: asdict(v) for k, v in ps.trades.items()},
+            "cooldowns": ps.cooldowns,
+            "last_scan_ts": ps.last_scan_ts,
+        }
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(out, f)
+    except Exception as e:
+        print(f"⚠️ state save failed: {e}")
+
+def load_state() -> PortfolioState:
+    try:
+        if not os.path.exists(STATE_PATH):
+            return PortfolioState(trades={}, cooldowns={}, last_scan_ts=0.0)
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        trades_raw = data.get("trades", {}) or {}
+        trades: Dict[str, TradeState] = {}
+        for sym, td in trades_raw.items():
+            try:
+                trades[sym] = TradeState(**td)
+            except Exception:
+                continue
+        cooldowns = data.get("cooldowns", {}) or {}
+        last_scan_ts = float(data.get("last_scan_ts", 0.0))
+        return PortfolioState(trades=trades, cooldowns=cooldowns, last_scan_ts=last_scan_ts)
+    except Exception as e:
+        print(f"⚠️ state load failed: {e}")
+        return PortfolioState(trades={}, cooldowns={}, last_scan_ts=0.0)
+
+# =========================================================
+# SCAN: return top candidates (not just one)
+# =========================================================
+def scan_candidates(ps: PortfolioState, need_slots: int) -> List[Tuple[float, str, int, float, float]]:
+    """
+    Returns list of candidates sorted by score desc:
+      (score, symbol, side(+1/-1), pullback, vol)
+    Skips:
+      - already open trades
+      - cooldown symbols
+    """
+    now = time.time()
     tops = get_top_symbols_by_volume(UNIVERSE_QUOTE, TOP_N_COINS)
 
     seen = 0
@@ -474,13 +458,26 @@ def scan_for_entry_candidate() -> Optional[Tuple[str, int, float, float, float]]
     pullback_fail = 0
     reversal_fail = 0
     vol_fail = 0
+    skipped_open = 0
+    skipped_cd = 0
     ok = 0
 
-    best = None  # (score, sym, side, pb, vol)
     candidates: List[Tuple[float, str, int, float, float]] = []
+
+    open_syms = set(ps.trades.keys())
 
     for idx, sym in enumerate(tops):
         seen += 1
+
+        if sym in open_syms:
+            skipped_open += 1
+            continue
+
+        cd_until = float(ps.cooldowns.get(sym, 0.0) or 0.0)
+        if cd_until and now < cd_until:
+            skipped_cd += 1
+            continue
+
         try:
             tr = trend_direction(sym)
             if tr is None:
@@ -508,312 +505,303 @@ def scan_for_entry_candidate() -> Optional[Tuple[str, int, float, float, float]]
 
             ok += 1
 
+            # score
             rank_bonus = (len(tops) - idx) / max(1, len(tops))
             pb_mid = (PULLBACK_MIN_PCT + PULLBACK_MAX_PCT) / 2.0
             pb_closeness = 1.0 - min(1.0, abs(pb - pb_mid) / (pb_mid if pb_mid > 0 else 1.0))
             vol_mid = (VOL_MIN + VOL_MAX) / 2.0
             vol_closeness = 1.0 - min(1.0, abs(vol - vol_mid) / (vol_mid if vol_mid > 0 else 1.0))
-
             score = 0.55 * rank_bonus + 0.25 * pb_closeness + 0.20 * vol_closeness
 
             candidates.append((score, sym, tr, pb, vol))
-            if best is None or score > best[0]:
-                best = (score, sym, tr, pb, vol)
 
         except Exception:
             data_fail += 1
             continue
 
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
     if DEBUG_SCAN == 1:
         print(
-            f"SCAN_DEBUG | seen={seen} ok={ok} | "
-            f"trend_fail={trend_fail} data_fail={data_fail} "
-            f"pullback_fail={pullback_fail} reversal_fail={reversal_fail} vol_fail={vol_fail}"
+            f"SCAN_DEBUG | seen={seen} ok={ok} needSlots={need_slots} | "
+            f"skip_open={skipped_open} skip_cd={skipped_cd} | "
+            f"trend_fail={trend_fail} data_fail={data_fail} pullback_fail={pullback_fail} "
+            f"reversal_fail={reversal_fail} vol_fail={vol_fail}"
         )
         if candidates:
-            candidates.sort(reverse=True, key=lambda x: x[0])
             print("SCAN_DEBUG_TOP:")
             for sc, sym, tr, pb, vol in candidates[:max(1, DEBUG_TOPK)]:
                 side_txt = "LONG" if tr > 0 else "SHORT"
                 print(f"  - {sym} {side_txt} | score={sc:.3f} pb={pb*100:.2f}% vol={vol:.5f}")
 
-    if best is None:
-        return None
+    return candidates[:max(0, need_slots)]
 
-    return best[1], best[2], best[0], best[3], best[4]
+# =========================================================
+# GLOBAL EXPOSURE (estimate only, for guard)
+# =========================================================
+def portfolio_est_exposure(ps: PortfolioState) -> float:
+    return sum(t.usd_est for t in ps.trades.values() if t.open)
+
+# =========================================================
+# RECOVER OPEN POSITIONS (LIVE)
+# =========================================================
+def recover_live_positions(ps: PortfolioState) -> None:
+    if TRADING_ENABLED == 0 or RECOVER_OPEN_POS != 1:
+        return
+    try:
+        positions = client.futures_position_information(recvWindow=RECV_WINDOW)
+        for p in positions:
+            sym = p.get("symbol", "")
+            if not sym or not sym.endswith(UNIVERSE_QUOTE):
+                continue
+            amt = float(p.get("positionAmt", "0") or 0.0)
+            if amt == 0.0:
+                continue
+            side = +1 if amt > 0 else -1
+            if sym in ps.trades:
+                continue
+            mark = get_mark(sym)
+            ensure_symbol_settings(sym)
+            ts = TradeState(
+                symbol=sym,
+                side=side,
+                open=True,
+                entry_time=time.time(),
+                level=1,
+                next_add_price=dca_next_add_price(mark, side, DCA_STEP_PCT, 1),
+                avg_entry_est=mark,
+                pos_qty_est=0.0,
+                usd_est=DCA_BASE_USD,
+            )
+            ps.trades[sym] = ts
+            print(f"⚠️ RECOVERED {sym} {'LONG' if side>0 else 'SHORT'} amt={amt} mark={mark:.6f}")
+    except Exception as e:
+        print(f"⚠️ recover failed: {e}")
+
+# =========================================================
+# TRADE MANAGEMENT
+# =========================================================
+def close_trade(ps: PortfolioState, sym: str, reason: str) -> None:
+    ts = ps.trades.get(sym)
+    if not ts:
+        return
+    print(f"🧯 CLOSE {sym} reason={reason}")
+    if TRADING_ENABLED == 1:
+        amt, _ = get_position(sym)
+        if amt != 0.0:
+            close_market_reduce_only(sym, amt)
+    # cooldown only for this symbol
+    ps.cooldowns[sym] = time.time() + COOLDOWN_MIN * 60
+    # remove from open trades
+    ps.trades.pop(sym, None)
+
+def force_close_if_crossed(ps: PortfolioState, sym: str, expected_side: int) -> bool:
+    """
+    Returns True if force-closed due to crossed direction.
+    """
+    if TRADING_ENABLED == 0:
+        return False
+    amt, _ = get_position(sym)
+    if amt == 0.0:
+        return False
+    exch_side = +1 if amt > 0 else -1
+    if exch_side != expected_side:
+        print(f"🛑 CROSSED DETECTED {sym} stateSide={expected_side} exchSide={exch_side} -> FORCE CLOSE")
+        close_market_reduce_only(sym, amt)
+        ps.cooldowns[sym] = time.time() + COOLDOWN_MIN * 60
+        ps.trades.pop(sym, None)
+        return True
+    return False
 
 # =========================================================
 # MAIN
 # =========================================================
 def main():
     sync_time()
-    st = load_state()
+    ps = load_state()
+    if ps.trades is None:
+        ps.trades = {}
+    if ps.cooldowns is None:
+        ps.cooldowns = {}
 
-    print("✅ DCA SCALP Bot — AUTO SYMBOL + AUTO SIDE + PnL Exit + Exposure Guard + CROSSED-POSITION GUARD")
+    print("✅ DCA SCALP Bot — MULTI-TRADE + AUTO SYMBOL + AUTO SIDE + Per-Symbol Cooldown + MAX_OPEN_TRADES")
     print(f"TRADING_ENABLED={TRADING_ENABLED} | HEDGE_MODE(FORCED)={HEDGE_MODE} | LEVERAGE={LEVERAGE} | MARGIN_TYPE={MARGIN_TYPE}")
-    print(f"Universe={UNIVERSE_QUOTE} TOP_N_COINS={TOP_N_COINS} | TREND={TREND_INTERVAL} EMA{TREND_EMA} | ENTRY={ENTRY_INTERVAL} EMA{FAST_EMA}/{SLOW_EMA}")
+    print(f"Universe={UNIVERSE_QUOTE} TOP_N_COINS={TOP_N_COINS} | MAX_OPEN_TRADES={MAX_OPEN_TRADES}")
+    print(f"TREND={TREND_INTERVAL} EMA{TREND_EMA} | ENTRY={ENTRY_INTERVAL} EMA{FAST_EMA}/{SLOW_EMA} | LOOKBACK_MINUTES={LOOKBACK_MINUTES}")
     print(f"Pullback: lookback={PULLBACK_LOOKBACK_BARS} min={PULLBACK_MIN_PCT*100:.2f}% max={PULLBACK_MAX_PCT*100:.2f}%")
     print(f"Vol: lookbackBars={VOL_LOOKBACK_BARS} min={VOL_MIN} max={VOL_MAX}")
     print(f"DCA: base={DCA_BASE_USD} step={DCA_STEP_PCT*100:.2f}% mult={DCA_MULT} maxLv={DCA_MAX_LEVELS}")
     print(f"PnL Exit: use={USE_PNL_EXIT} TP={TP_PNL_USD} SL={SL_PNL_USD} | Price Exit: use={USE_PRICE_EXIT} TP%={TP_PCT*100:.2f} Stop%={HARD_STOP_PCT*100:.2f} TimeStop={TIME_STOP_MIN}m")
-    print(f"Exposure: max={MAX_TOTAL_USD_EXPOSURE} action={EXPOSURE_ACTION} | Cooldown={COOLDOWN_MIN}m Reselect={RESELECT_MIN}m")
-    print(f"LOOKBACK_MINUTES={LOOKBACK_MINUTES} | CHECK_SEC={CHECK_SEC} | DEBUG_SCAN={DEBUG_SCAN}")
+    print(f"Exposure: perTradeMax={MAX_USD_PER_TRADE} totalMax={MAX_TOTAL_USD_EXPOSURE} action={EXPOSURE_ACTION}")
+    print(f"COOLDOWN_MIN(per symbol)={COOLDOWN_MIN} | RESELECT_MIN={RESELECT_MIN} | CHECK_SEC={CHECK_SEC} | DEBUG_SCAN={DEBUG_SCAN}")
 
-    # Recover open position on restart (live)
-    if TRADING_ENABLED == 1 and RECOVER_OPEN_POS == 1:
-        sym = get_any_open_position_symbol()
-        if sym:
-            st.symbol = sym
-            amt, pnl = get_position(sym)
-            st.open = (amt != 0.0)
-            st.side = +1 if amt > 0 else -1
-            if st.entry_time == 0.0:
-                st.entry_time = time.time()
-            if st.level == 0:
-                st.level = 1
-            if st.total_usd_est == 0.0:
-                st.total_usd_est = DCA_BASE_USD
-            if st.avg_entry_est == 0.0:
-                st.avg_entry_est = get_mark(sym)
-            st.next_add_price = dca_next_add_price(st.avg_entry_est, st.side, DCA_STEP_PCT, st.level)
-            ensure_symbol_settings(sym)
-            save_state(st)
-            print(f"⚠️ RECOVERED open position: {sym} amt={amt} pnl={pnl:.2f} side={'LONG' if st.side>0 else 'SHORT'}")
+    # Recover (live)
+    recover_live_positions(ps)
+    save_state(ps)
+
+    last_heartbeat = 0.0
 
     while True:
         try:
             now = time.time()
 
-            # Cooldown after close
-            if st.last_close_time and (now - st.last_close_time) < (COOLDOWN_MIN * 60):
-                time.sleep(CHECK_SEC)
-                continue
+            # Heartbeat
+            if DEBUG_EVERY_SEC > 0 and now - last_heartbeat >= DEBUG_EVERY_SEC:
+                last_heartbeat = now
+                active_cd = sum(1 for _, t in ps.cooldowns.items() if now < float(t))
+                print(f"HEARTBEAT | openTrades={len(ps.trades)}/{MAX_OPEN_TRADES} | cooldownActive={active_cd} | estExposure={portfolio_est_exposure(ps):.2f}")
 
             # =========================
-            # LIVE: always trust exchange + crossed guard
+            # 1) MANAGE ALL OPEN TRADES
             # =========================
-            if TRADING_ENABLED == 1 and st.symbol:
-                amt, pnl = get_position(st.symbol)
+            to_close: List[Tuple[str, str]] = []
 
-                if amt != 0.0:
-                    exch_side = +1 if amt > 0 else -1
-
-                    # Crossed/flip guard:
-                    # If state says one direction but exchange is opposite -> close immediately (no flip opens)
-                    if st.side != 0 and exch_side != st.side:
-                        print(f"🛑 CROSSED DETECTED {st.symbol} | stateSide={st.side} exchSide={exch_side} -> FORCE CLOSE")
-                        close_market_reduce_only(st.symbol, amt)
-                        reset_position_state(st)
-                        st.last_close_time = time.time()
-                        save_state(st)
-                        time.sleep(2)
-                        continue
-
-                    st.open = True
-                    st.side = exch_side  # keep aligned with exchange truth
-                else:
-                    # Exchange flat
-                    if st.open:
-                        reset_position_state(st)
-                        st.last_close_time = now
-                        save_state(st)
-                    st.open = False
-
-            # =========================
-            # FLAT: scan + enter
-            # =========================
-            if not st.open:
-                if st.last_scan_ts and (now - st.last_scan_ts) < (RESELECT_MIN * 60):
-                    time.sleep(CHECK_SEC)
+            for sym, ts in list(ps.trades.items()):
+                # safety: crossed guard
+                if force_close_if_crossed(ps, sym, ts.side):
                     continue
 
-                st.last_scan_ts = now
-                cand = scan_for_entry_candidate()
-                if not cand:
-                    print("SCAN: no entry candidates now.")
-                    save_state(st)
-                    time.sleep(CHECK_SEC)
-                    continue
-
-                sym, side, score, pb, vol = cand
-                st.symbol = sym
-                st.side = side
-                ensure_symbol_settings(sym)
-
-                side_txt = "LONG" if side > 0 else "SHORT"
                 mark = get_mark(sym)
+                held_min = (now - ts.entry_time) / 60.0 if ts.entry_time else 0.0
+                side_txt = "LONG" if ts.side > 0 else "SHORT"
 
-                st.open = True
-                st.entry_time = now
-                st.level = 1
-                st.avg_entry_est = mark
-                st.pos_qty_est = 0.0
-                st.total_usd_est = DCA_BASE_USD
-                st.next_add_price = dca_next_add_price(st.avg_entry_est, st.side, DCA_STEP_PCT, st.level)
+                if TRADING_ENABLED == 1 and USE_PNL_EXIT == 1:
+                    amt, pnl = get_position(sym)
+                    if amt == 0.0:
+                        # exchange flat unexpectedly
+                        to_close.append((sym, "EXCHANGE_FLAT"))
+                        continue
 
-                if TRADING_ENABLED == 0:
-                    print(f"[DRY] ENTRY {sym} side={side_txt} score={score:.3f} pb={pb*100:.2f}% vol={vol:.5f} mark={mark:.6f} usd={DCA_BASE_USD:.2f} nextAdd={st.next_add_price:.6f}")
+                    print(f"POS {sym} {side_txt} | mark={mark:.6f} | pnl={pnl:.2f} | lv={ts.level}/{DCA_MAX_LEVELS} | estExp={ts.usd_est:.2f} | nextAdd={ts.next_add_price:.6f} | held={held_min:.1f}m")
+
+                    if pnl >= TP_PNL_USD:
+                        to_close.append((sym, "TP_PNL"))
+                        continue
+                    if pnl <= SL_PNL_USD:
+                        to_close.append((sym, "SL_PNL"))
+                        continue
                 else:
-                    print(f"🚀 ENTRY {sym} side={side_txt} score={score:.3f} pb={pb*100:.2f}% vol={vol:.5f} mark={mark:.6f} usd={DCA_BASE_USD:.2f} nextAdd={st.next_add_price:.6f}")
-                    open_market(sym, st.side, DCA_BASE_USD)
+                    print(f"POS {sym} {side_txt} | mark={mark:.6f} | lv={ts.level}/{DCA_MAX_LEVELS} | estExp={ts.usd_est:.2f} | nextAdd={ts.next_add_price:.6f} | held={held_min:.1f}m")
 
-                save_state(st)
-                time.sleep(1)
-                continue
+                # Price exits (based on estimated avg)
+                if USE_PRICE_EXIT == 1 and ts.avg_entry_est > 0:
+                    tp_px = price_tp(ts.avg_entry_est, ts.side, TP_PCT)
+                    sl_px = price_stop(ts.avg_entry_est, ts.side, HARD_STOP_PCT)
 
-            # =========================
-            # OPEN: manage
-            # =========================
-            sym = st.symbol
-            if not sym:
-                reset_position_state(st)
-                save_state(st)
-                time.sleep(CHECK_SEC)
-                continue
-
-            mark = get_mark(sym)
-            held_min = (now - st.entry_time) / 60.0 if st.entry_time else 0.0
-            side_txt = "LONG" if st.side > 0 else "SHORT"
-
-            # Live PnL exits
-            if TRADING_ENABLED == 1 and USE_PNL_EXIT == 1:
-                amt, pnl = get_position(sym)
-                if amt == 0.0:
-                    print("⚠️ Exchange flat while state open -> reset")
-                    reset_position_state(st)
-                    st.last_close_time = time.time()
-                    save_state(st)
-                    time.sleep(2)
-                    continue
-
-                exch_side = +1 if amt > 0 else -1
-                if exch_side != st.side:
-                    print(f"🛑 CROSSED DETECTED mid-run {sym} | stateSide={st.side} exchSide={exch_side} -> FORCE CLOSE")
-                    close_market_reduce_only(sym, amt)
-                    reset_position_state(st)
-                    st.last_close_time = time.time()
-                    save_state(st)
-                    time.sleep(2)
-                    continue
-
-                print(f"POS {sym} {side_txt} | mark={mark:.6f} | pnl={pnl:.2f} | lv={st.level}/{DCA_MAX_LEVELS} | estExp={st.total_usd_est:.2f} | nextAdd={st.next_add_price:.6f} | held={held_min:.1f}m")
-
-                if pnl >= TP_PNL_USD:
-                    print(f"✅ TP_PNL hit pnl={pnl:.2f} -> close")
-                    close_market_reduce_only(sym, amt)
-                    reset_position_state(st)
-                    st.last_close_time = time.time()
-                    save_state(st)
-                    time.sleep(2)
-                    continue
-
-                if pnl <= SL_PNL_USD:
-                    print(f"🛑 SL_PNL hit pnl={pnl:.2f} -> close")
-                    close_market_reduce_only(sym, amt)
-                    reset_position_state(st)
-                    st.last_close_time = time.time()
-                    save_state(st)
-                    time.sleep(2)
-                    continue
-            else:
-                print(f"POS {sym} {side_txt} | mark={mark:.6f} | lv={st.level}/{DCA_MAX_LEVELS} | estExp={st.total_usd_est:.2f} | nextAdd={st.next_add_price:.6f} | held={held_min:.1f}m")
-
-            # Price exits
-            if USE_PRICE_EXIT == 1 and st.avg_entry_est > 0:
-                tp_px = price_tp(st.avg_entry_est, st.side, TP_PCT)
-                sl_px = price_stop(st.avg_entry_est, st.side, HARD_STOP_PCT)
-
-                if (st.side > 0 and mark >= tp_px) or (st.side < 0 and mark <= tp_px):
-                    print("✅ PRICE_TP -> close")
-                    if TRADING_ENABLED == 1:
-                        amt, _ = get_position(sym)
-                        close_market_reduce_only(sym, amt)
-                    reset_position_state(st)
-                    st.last_close_time = time.time()
-                    save_state(st)
-                    time.sleep(2)
-                    continue
-
-                if (st.side > 0 and mark <= sl_px) or (st.side < 0 and mark >= sl_px):
-                    print("🛑 PRICE_STOP -> close")
-                    if TRADING_ENABLED == 1:
-                        amt, _ = get_position(sym)
-                        close_market_reduce_only(sym, amt)
-                    reset_position_state(st)
-                    st.last_close_time = time.time()
-                    save_state(st)
-                    time.sleep(2)
-                    continue
-
-            if held_min >= TIME_STOP_MIN:
-                print("⏳ TIME_STOP -> close")
-                if TRADING_ENABLED == 1:
-                    amt, _ = get_position(sym)
-                    close_market_reduce_only(sym, amt)
-                reset_position_state(st)
-                st.last_close_time = time.time()
-                save_state(st)
-                time.sleep(2)
-                continue
-
-            # DCA add
-            can_add = (st.level < DCA_MAX_LEVELS)
-            hit_add = (st.side > 0 and mark <= st.next_add_price) or (st.side < 0 and mark >= st.next_add_price)
-
-            if can_add and hit_add:
-                usd_add = DCA_BASE_USD * (DCA_MULT ** (st.level - 1))
-                projected = st.total_usd_est + usd_add
-
-                if projected > MAX_TOTAL_USD_EXPOSURE:
-                    if EXPOSURE_ACTION == "FORCE_CLOSE":
-                        print(f"🧯 EXPOSURE LIMIT -> FORCE_CLOSE | est={st.total_usd_est:.2f} + add={usd_add:.2f} > max={MAX_TOTAL_USD_EXPOSURE:.2f}")
-                        if TRADING_ENABLED == 1:
-                            amt, _ = get_position(sym)
-                            close_market_reduce_only(sym, amt)
-                        reset_position_state(st)
-                        st.last_close_time = time.time()
-                        save_state(st)
-                        time.sleep(2)
+                    if (ts.side > 0 and mark >= tp_px) or (ts.side < 0 and mark <= tp_px):
+                        to_close.append((sym, "PRICE_TP"))
                         continue
+
+                    if (ts.side > 0 and mark <= sl_px) or (ts.side < 0 and mark >= sl_px):
+                        to_close.append((sym, "PRICE_STOP"))
+                        continue
+
+                if held_min >= TIME_STOP_MIN:
+                    to_close.append((sym, "TIME_STOP"))
+                    continue
+
+                # DCA add
+                can_add = (ts.level < DCA_MAX_LEVELS)
+                hit_add = (ts.side > 0 and mark <= ts.next_add_price) or (ts.side < 0 and mark >= ts.next_add_price)
+                if can_add and hit_add:
+                    usd_add = DCA_BASE_USD * (DCA_MULT ** (ts.level - 1))
+                    projected_trade = ts.usd_est + usd_add
+                    projected_total = portfolio_est_exposure(ps) + usd_add
+
+                    if projected_trade > MAX_USD_PER_TRADE or projected_total > MAX_TOTAL_USD_EXPOSURE:
+                        if EXPOSURE_ACTION == "FORCE_CLOSE":
+                            to_close.append((sym, "EXPOSURE_FORCE_CLOSE"))
+                        else:
+                            print(f"⛔ EXPOSURE STOP_ADD {sym} | tradeProj={projected_trade:.2f}/{MAX_USD_PER_TRADE:.2f} totalProj={projected_total:.2f}/{MAX_TOTAL_USD_EXPOSURE:.2f}")
+                        continue
+
+                    # live pre-check crossed again before add
+                    if force_close_if_crossed(ps, sym, ts.side):
+                        continue
+
+                    ts.level += 1
+                    ts.usd_est = projected_trade
+
+                    # update estimated avg (for price exits and next add)
+                    add_qty = (usd_add / mark) if mark > 0 else 0.0
+                    total_cost = ts.avg_entry_est * ts.pos_qty_est + mark * add_qty
+                    ts.pos_qty_est += add_qty
+                    if ts.pos_qty_est > 0:
+                        ts.avg_entry_est = total_cost / ts.pos_qty_est
+
+                    ts.next_add_price = dca_next_add_price(ts.avg_entry_est, ts.side, DCA_STEP_PCT, ts.level)
+
+                    if TRADING_ENABLED == 0:
+                        print(f"[DRY] DCA ADD {sym} {side_txt} | lv={ts.level} usd={usd_add:.2f} mark={mark:.6f} newAvg={ts.avg_entry_est:.6f} nextAdd={ts.next_add_price:.6f} estExp={ts.usd_est:.2f}")
                     else:
-                        print(f"⛔ EXPOSURE LIMIT -> STOP_ADD | est={st.total_usd_est:.2f} + add={usd_add:.2f} > max={MAX_TOTAL_USD_EXPOSURE:.2f}")
-                        time.sleep(CHECK_SEC)
-                        continue
+                        print(f"➕ DCA ADD {sym} {side_txt} | lv={ts.level} usd={usd_add:.2f} mark={mark:.6f} newAvg={ts.avg_entry_est:.6f} nextAdd={ts.next_add_price:.6f} estExp={ts.usd_est:.2f}")
+                        open_market(sym, ts.side, usd_add)
 
-                # Live extra safety: ensure still same direction
-                if TRADING_ENABLED == 1:
-                    amt, _ = get_position(sym)
-                    if amt != 0.0:
-                        exch_side = +1 if amt > 0 else -1
-                        if exch_side != st.side:
-                            print(f"🛑 CROSSED DETECTED before add {sym} -> FORCE CLOSE")
-                            close_market_reduce_only(sym, amt)
-                            reset_position_state(st)
-                            st.last_close_time = time.time()
-                            save_state(st)
-                            time.sleep(2)
+            # Apply closes
+            for sym, reason in to_close:
+                close_trade(ps, sym, reason)
+
+            # =========================
+            # 2) FILL EMPTY SLOTS (SCAN & OPEN)
+            # =========================
+            open_count = len(ps.trades)
+            slots = max(0, MAX_OPEN_TRADES - open_count)
+
+            if slots > 0:
+                if ps.last_scan_ts and (now - ps.last_scan_ts) < (RESELECT_MIN * 60):
+                    save_state(ps)
+                    time.sleep(CHECK_SEC)
+                    continue
+
+                ps.last_scan_ts = now
+                cands = scan_candidates(ps, need_slots=slots)
+
+                if not cands:
+                    print("SCAN: no entry candidates now.")
+                else:
+                    for score, sym, side, pb, vol in cands:
+                        if len(ps.trades) >= MAX_OPEN_TRADES:
+                            break
+
+                        # re-check cooldown & open set (race safety)
+                        if sym in ps.trades:
+                            continue
+                        cd_until = float(ps.cooldowns.get(sym, 0.0) or 0.0)
+                        if cd_until and time.time() < cd_until:
                             continue
 
-                st.level += 1
-                st.total_usd_est = projected
+                        ensure_symbol_settings(sym)
+                        mark = get_mark(sym)
+                        side_txt = "LONG" if side > 0 else "SHORT"
 
-                add_qty = (usd_add / mark) if mark > 0 else 0.0
-                total_cost = st.avg_entry_est * st.pos_qty_est + mark * add_qty
-                st.pos_qty_est += add_qty
-                if st.pos_qty_est > 0:
-                    st.avg_entry_est = total_cost / st.pos_qty_est
+                        ts = TradeState(
+                            symbol=sym,
+                            side=side,
+                            open=True,
+                            entry_time=time.time(),
+                            level=1,
+                            next_add_price=dca_next_add_price(mark, side, DCA_STEP_PCT, 1),
+                            avg_entry_est=mark,
+                            pos_qty_est=0.0,
+                            usd_est=DCA_BASE_USD,
+                        )
 
-                st.next_add_price = dca_next_add_price(st.avg_entry_est, st.side, DCA_STEP_PCT, st.level)
+                        # exposure guards before entry
+                        projected_total = portfolio_est_exposure(ps) + ts.usd_est
+                        if ts.usd_est > MAX_USD_PER_TRADE or projected_total > MAX_TOTAL_USD_EXPOSURE:
+                            print(f"⛔ ENTRY EXPOSURE SKIP {sym} | trade={ts.usd_est:.2f}/{MAX_USD_PER_TRADE:.2f} totalProj={projected_total:.2f}/{MAX_TOTAL_USD_EXPOSURE:.2f}")
+                            continue
 
-                if TRADING_ENABLED == 0:
-                    print(f"[DRY] DCA ADD {sym} {side_txt} | lv={st.level} usd={usd_add:.2f} mark={mark:.6f} newAvg={st.avg_entry_est:.6f} nextAdd={st.next_add_price:.6f} estExp={st.total_usd_est:.2f}")
-                else:
-                    print(f"➕ DCA ADD {sym} {side_txt} | lv={st.level} usd={usd_add:.2f} mark={mark:.6f} newAvg={st.avg_entry_est:.6f} nextAdd={st.next_add_price:.6f} estExp={st.total_usd_est:.2f}")
-                    open_market(sym, st.side, usd_add)
+                        if TRADING_ENABLED == 0:
+                            print(f"[DRY] ENTRY {sym} side={side_txt} score={score:.3f} pb={pb*100:.2f}% vol={vol:.5f} mark={mark:.6f} usd={DCA_BASE_USD:.2f} nextAdd={ts.next_add_price:.6f}")
+                        else:
+                            print(f"🚀 ENTRY {sym} side={side_txt} score={score:.3f} pb={pb*100:.2f}% vol={vol:.5f} mark={mark:.6f} usd={DCA_BASE_USD:.2f} nextAdd={ts.next_add_price:.6f}")
+                            open_market(sym, side, DCA_BASE_USD)
 
-                save_state(st)
-                time.sleep(1)
+                        ps.trades[sym] = ts
+                        time.sleep(0.5)
 
+            save_state(ps)
             time.sleep(CHECK_SEC)
 
         except Exception as e:
